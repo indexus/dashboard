@@ -1,0 +1,519 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Header from "./components/Header.jsx";
+import MapPanel from "./components/MapPanel.jsx";
+import AggregateHeatmap from "./components/AggregateHeatmap.jsx";
+import { AddItemModal } from "./components/AddItemForm.jsx";
+import OpsPanel from "./components/OpsPanel.jsx";
+import DataSidePanel, {
+  HitsList,
+  NearbyControls,
+} from "./components/DataSidePanel.jsx";
+import { getHealth, getMesh } from "./lib/api.js";
+import {
+  addGeoItem,
+  bootstrapHost,
+  COLLECTION_PRESETS,
+  DETAIL_LIMIT,
+  ensureToken,
+  formatDistanceKm,
+  hostsFromMesh,
+  SearchSession,
+} from "./lib/sdk.js";
+
+function prefersDarkColorScheme() {
+  try {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  } catch {
+    return true;
+  }
+}
+
+function readStoredTheme() {
+  try {
+    const v = localStorage.getItem("mesh-dash-theme");
+    if (v === "white" || v === "dark") return v;
+  } catch (_) {}
+  return prefersDarkColorScheme() ? "dark" : "white";
+}
+
+export default function App() {
+  const [tab, setTab] = useState("ops");
+  const [mesh, setMesh] = useState(null);
+  const [health, setHealth] = useState(null);
+  const [pollErr, setPollErr] = useState(null);
+  const [theme, setTheme] = useState(readStoredTheme);
+
+  const [collection, setCollection] = useState(COLLECTION_PRESETS[0].id);
+  const [mode, setMode] = useState("aggregate");
+  const [sideView, setSideView] = useState("controls");
+  const [auto, setAuto] = useState(true);
+  const [step, setStep] = useState(10);
+  const [normalizer, setNormalizer] = useState(10000);
+  const [detailLimit] = useState(DETAIL_LIMIT);
+  const [origin, setOrigin] = useState({ lat: 48.8566, lng: 2.3522 });
+  const [itemId, setItemId] = useState("");
+  const [hits, setHits] = useState([]);
+  const [allHits, setAllHits] = useState([]);
+  const [selectedCell, setSelectedCell] = useState(null);
+  const [hoveredHit, setHoveredHit] = useState(null);
+  const [fitNonce, setFitNonce] = useState(0);
+  const [dataStatus, setDataStatus] = useState(
+    "aggregate · WebGPU heatmap · pan / zoom",
+  );
+  const [dataErr, setDataErr] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [canNext, setCanNext] = useState(false);
+  const [bearer, setBearer] = useState(() => globalThis.__INDEXUS_BEARER__ || "");
+  const [addOpen, setAddOpen] = useState(false);
+  /** Frozen peer list for Data — mesh polls must not remount Aggregate/Nearby. */
+  const [dataHosts, setDataHosts] = useState([]);
+  const [dataEpoch, setDataEpoch] = useState(0);
+  const dataHostsReady = useRef(false);
+  const dataHostsRef = useRef([]);
+
+  const sessionRef = useRef(null);
+  const cumulativeRef = useRef([]);
+  const originKeyRef = useRef("");
+  const autoTimerRef = useRef(null);
+  const searchGenRef = useRef(0);
+
+  const boot = health?.boot || mesh?.boot || null;
+  const bootHost = useMemo(
+    () => mesh?.bootstrap || bootstrapHost(boot, health?.p2p_port || 21000),
+    [mesh?.bootstrap, boot, health?.p2p_port],
+  );
+  const liveHosts = useMemo(
+    () => hostsFromMesh(mesh, bootHost),
+    [mesh, bootHost],
+  );
+  /** Data view uses a snapshot; Ops uses liveHosts via mesh prop. */
+  const hosts = dataHosts.length ? dataHosts : liveHosts;
+
+  const tick = useCallback(async () => {
+    try {
+      const [m, h] = await Promise.all([
+        getMesh(),
+        getHealth().catch(() => null),
+      ]);
+      setMesh(m);
+      if (h) setHealth(h);
+      setPollErr(m?.error || null);
+      const nextBoot =
+        h?.boot ||
+        m?.boot ||
+        null;
+      const nextHost =
+        m?.bootstrap ||
+        bootstrapHost(nextBoot, h?.p2p_port || 21000);
+      const nextHosts = hostsFromMesh(m, nextHost);
+      if (!dataHostsReady.current && nextHosts.length) {
+        dataHostsReady.current = true;
+        dataHostsRef.current = nextHosts;
+        setDataHosts(nextHosts);
+      } else if (dataHostsReady.current && nextHosts.length) {
+        // Remesh / restart: frozen peers no longer exist — adopt live set.
+        const live = new Set(nextHosts);
+        const stale = dataHostsRef.current.every((h) => !live.has(h));
+        if (stale) {
+          dataHostsRef.current = nextHosts;
+          setDataHosts(nextHosts);
+          sessionRef.current = null;
+        }
+      }
+    } catch (e) {
+      setPollErr(e.message);
+    }
+  }, []);
+
+  // Ops / header: keep mesh + peers fresh. Data tab does not remount on this.
+  useEffect(() => {
+    tick();
+    if (tab !== "ops") return undefined;
+    const id = setInterval(tick, 3000);
+    return () => clearInterval(id);
+  }, [tick, tab]);
+
+  // Light header health while on Data (no mesh fan-out that churns peers).
+  useEffect(() => {
+    if (tab === "ops") return undefined;
+    const id = setInterval(() => {
+      getHealth()
+        .then((h) => {
+          if (h) setHealth(h);
+        })
+        .catch(() => {});
+    }, 10000);
+    return () => clearInterval(id);
+  }, [tab]);
+
+  const resetData = useCallback(async () => {
+    setBusy(true);
+    setDataErr(false);
+    setDataStatus("reset · refreshing peers…");
+    try {
+      const [m, h] = await Promise.all([
+        getMesh(),
+        getHealth().catch(() => null),
+      ]);
+      setMesh(m);
+      if (h) setHealth(h);
+      const nextBoot = h?.boot || m?.boot || null;
+      const nextHost =
+        m?.bootstrap || bootstrapHost(nextBoot, h?.p2p_port || 21000);
+      const nextHosts = hostsFromMesh(m, nextHost);
+      dataHostsReady.current = nextHosts.length > 0;
+      dataHostsRef.current = nextHosts;
+      setDataHosts(nextHosts);
+      sessionRef.current = null;
+      cumulativeRef.current = [];
+      setHits([]);
+      setAllHits([]);
+      setCanNext(false);
+      setSelectedCell(null);
+      setDataEpoch((e) => e + 1);
+      setDataStatus(
+        nextHosts.length
+          ? `reset · ${nextHosts.length} peer(s)`
+          : "reset · no peers yet",
+      );
+    } catch (e) {
+      setDataErr(true);
+      setDataStatus(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    ensureToken()
+      .then((tok) => {
+        if (!cancelled) setBearer(tok);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setDataErr(true);
+          setDataStatus(e.message || String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const key = `${collection}|${origin.lat.toFixed(6)}|${origin.lng.toFixed(6)}`;
+    if (key === originKeyRef.current && sessionRef.current) return;
+    originKeyRef.current = key;
+    sessionRef.current = null;
+    cumulativeRef.current = [];
+    setCanNext(false);
+    if (mode === "nearby") {
+      setHits([]);
+      setAllHits([]);
+    }
+  }, [collection, origin.lat, origin.lng, mode]);
+
+  const onAggStatus = useCallback((msg) => {
+    setDataStatus(msg);
+    setDataErr(false);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem("mesh-dash-theme", theme);
+    } catch (_) {}
+  }, [theme]);
+
+  const runSearch = useCallback(
+    async (next) => {
+      if (!hosts.length) {
+        setDataErr(true);
+        setDataStatus("no mesh hosts — wait for Ops nodes or set BOOT_IP");
+        return;
+      }
+      const gen = ++searchGenRef.current;
+      setBusy(true);
+      setDataErr(false);
+      setDataStatus(
+        next
+          ? `next ${step} via ${hosts.length} host(s)…`
+          : `query ${step} nearest via ${hosts.length} host(s)…`,
+      );
+      try {
+        if (!next || !sessionRef.current) {
+          sessionRef.current = new SearchSession({
+            collectionName: collection,
+            hosts,
+            lat: origin.lat,
+            lng: origin.lng,
+            step,
+          });
+          cumulativeRef.current = [];
+        }
+        const { items, peers } = await sessionRef.current.search(step);
+        if (gen !== searchGenRef.current) return;
+        setCanNext(items.length > 0);
+        const ranked = items.map((it, i) => ({
+          ...it,
+          rank: cumulativeRef.current.length + i + 1,
+        }));
+        cumulativeRef.current = [...cumulativeRef.current, ...ranked];
+        setHits(ranked);
+        setAllHits([...cumulativeRef.current]);
+        if (ranked.length) setFitNonce((n) => n + 1);
+        setDataStatus(
+          ranked.length
+            ? `got ${ranked.length} · total ${cumulativeRef.current.length} · peers ${peers}`
+            : "no more results",
+        );
+        if (!ranked.length) setCanNext(false);
+      } catch (e) {
+        if (gen !== searchGenRef.current) return;
+        setDataErr(true);
+        setDataStatus(e.message || String(e));
+        if (!next) sessionRef.current = null;
+      } finally {
+        if (gen === searchGenRef.current) setBusy(false);
+      }
+    },
+    [hosts, collection, origin.lat, origin.lng, step],
+  );
+
+  const loadNextHits = useCallback(() => {
+    if (busy || !canNext) return;
+    runSearch(true);
+  }, [busy, canNext, runSearch]);
+
+  useEffect(() => {
+    if (!auto || mode !== "nearby" || !hosts.length || tab !== "data") return;
+    if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    autoTimerRef.current = setTimeout(() => {
+      runSearch(false);
+    }, 450);
+    return () => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    };
+  }, [
+    auto,
+    mode,
+    hosts,
+    collection,
+    origin.lat,
+    origin.lng,
+    step,
+    tab,
+    runSearch,
+  ]);
+
+  async function onAdd() {
+    if (!hosts.length) {
+      setDataErr(true);
+      setDataStatus("no mesh hosts");
+      return;
+    }
+    setBusy(true);
+    setDataErr(false);
+    setDataStatus("adding…");
+    try {
+      const out = await addGeoItem({
+        collectionName: collection,
+        hosts,
+        lat: origin.lat,
+        lng: origin.lng,
+        id: itemId.trim() || undefined,
+      });
+      setItemId("");
+      setAddOpen(false);
+      setDataStatus(`added ${out.id} · peers ${out.peers}`);
+      sessionRef.current = null;
+      cumulativeRef.current = [];
+      setCanNext(false);
+      if (mode === "nearby" && auto) runSearch(false);
+    } catch (e) {
+      setDataErr(true);
+      setDataStatus(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onMapClick({ lat, lng }) {
+    setOrigin({ lat, lng });
+    setDataStatus(`origin ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
+    setDataErr(false);
+  }
+
+  function onHitFocus(h) {
+    if (h?.lat == null || h?.lng == null) return;
+    setSelectedCell(h);
+    setDataStatus(
+      `#${h.rank ?? ""} ${h.id || h.kind || "cell"}` +
+        (h.distance != null
+          ? ` · ${formatDistanceKm(h.distance) || ""}`
+          : h.value != null
+            ? ` · v=${Number(h.value).toFixed(2)}`
+            : "") +
+        ` · ${h.lat.toFixed(4)}, ${h.lng.toFixed(4)}`,
+    );
+  }
+
+  function onMode(next) {
+    setMode(next);
+    setHits([]);
+    setAllHits([]);
+    setCanNext(false);
+    sessionRef.current = null;
+    cumulativeRef.current = [];
+    setSelectedCell(null);
+    setHoveredHit(null);
+    setSideView(next === "nearby" ? "items" : "controls");
+    setDataStatus(
+      next === "nearby"
+        ? auto
+          ? "auto nearby · click map to set origin"
+          : "nearby · Query / Next"
+        : "aggregate · WebGPU heatmap · pan / zoom",
+    );
+  }
+
+  const displayHits = allHits.length ? allHits : hits;
+
+  const peerHint = hosts.length
+    ? `${hosts.length} peer(s)${mode === "nearby" && auto ? " · auto" : ""}`
+    : "waiting for mesh…";
+
+  return (
+    <div className={`app theme-${theme}`}>
+      <Header
+        error={!!pollErr}
+        theme={theme}
+        onTheme={setTheme}
+        tab={tab}
+        onTab={setTab}
+        collection={collection}
+        onCollection={setCollection}
+        mode={mode}
+        onMode={onMode}
+        peerHint={peerHint}
+        onReset={resetData}
+        busy={busy}
+      />
+
+      {pollErr && <div className="err-banner">{pollErr}</div>}
+
+      <div
+        className={tab === "ops" ? "tab-panel" : "tab-panel hidden"}
+        hidden={tab !== "ops"}
+      >
+        <OpsPanel mesh={mesh} onSelectCollection={setCollection} />
+      </div>
+
+      <div
+        className={tab === "data" ? "tab-panel" : "tab-panel hidden"}
+        hidden={tab !== "data"}
+      >
+        <section className="data-section">
+          <div className="data-layout">
+            {mode === "aggregate" ? (
+              <AggregateHeatmap
+                key={`agg-${dataEpoch}-${collection}`}
+                collection={collection}
+                hosts={hosts}
+                bearer={bearer}
+                detailLimit={detailLimit}
+                center={[origin.lng, origin.lat]}
+                zoom={6}
+                theme={theme}
+                onStatus={onAggStatus}
+                onAddClick={() => setAddOpen(true)}
+                sideView={sideView}
+                onSideView={setSideView}
+                onRefresh={resetData}
+                refreshBusy={busy}
+              />
+            ) : (
+              <>
+                <MapPanel
+                  key={`near-${dataEpoch}`}
+                  center={[origin.lng, origin.lat]}
+                  origin={origin}
+                  hits={displayHits}
+                  onMapClick={onMapClick}
+                  onHitFocus={onHitFocus}
+                  active={tab === "data"}
+                  fitNonce={fitNonce}
+                  theme={theme}
+                  normalizer={normalizer}
+                  hoverHit={hoveredHit}
+                  onRefresh={resetData}
+                  refreshBusy={busy}
+                />
+                <DataSidePanel
+                  view={sideView}
+                  onView={setSideView}
+                  onAddClick={() => setAddOpen(true)}
+                  itemCount={displayHits.length}
+                  controls={
+                    <NearbyControls
+                      origin={origin}
+                      step={step}
+                      onStep={setStep}
+                      normalizer={normalizer}
+                      onNormalizer={setNormalizer}
+                      auto={auto}
+                      onAuto={setAuto}
+                      onQuery={() => runSearch(false)}
+                      onNext={loadNextHits}
+                      canNext={canNext}
+                      busy={busy}
+                    />
+                  }
+                  items={
+                    <HitsList
+                      hits={displayHits}
+                      selected={selectedCell}
+                      onFocus={onHitFocus}
+                      onHover={setHoveredHit}
+                      empty={auto ? "auto-querying…" : "click map, then Query"}
+                      onLoadMore={loadNextHits}
+                      hasMore={canNext}
+                      loadingMore={busy}
+                    />
+                  }
+                />
+              </>
+            )}
+          </div>
+
+          <AddItemModal
+            open={addOpen}
+            onClose={() => setAddOpen(false)}
+            lat={origin.lat}
+            lng={origin.lng}
+            id={itemId}
+            onLat={(v) =>
+              setOrigin((o) => ({ ...o, lat: Number.isFinite(v) ? v : o.lat }))
+            }
+            onLng={(v) =>
+              setOrigin((o) => ({ ...o, lng: Number.isFinite(v) ? v : o.lng }))
+            }
+            onId={setItemId}
+            onAdd={onAdd}
+            busy={busy}
+          />
+          <div className={`status-line${dataErr ? " err" : ""}`}>{dataStatus}</div>
+        </section>
+      </div>
+
+      <footer className="app-foot">
+        {tab === "ops"
+          ? "ops · mesh · spawn · snapshots · data load"
+          : mode === "nearby"
+            ? "nearby · Local.search · auto query / Next N"
+            : "aggregate · €/m² · WebGPU"}
+      </footer>
+    </div>
+  );
+}

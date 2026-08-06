@@ -1,0 +1,38 @@
+{
+  "name": "@indexus/dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,vite -c teal,cyan \"node server.js\" \"vite\"",
+    "build": "vite build",
+    "start": "NODE_ENV=production node server.js",
+    "preview": "vite preview",
+    "load-dvf": "node scripts/load_dvf.js --year 2020",
+    "load-dvf:sample": "node scripts/load_dvf.js --year 2020 --limit 5000",
+    "load-dvf:2020": "node scripts/load_dvf.js --year 2020",
+    "load-density": "node scripts/load_density.js --count 40000",
+    "load-density:sample": "node scripts/load_density.js --count 5000"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "buffer": "^6.0.3",
+    "csv-parser": "^3.2.1",
+    "d3": "^7.9.0",
+    "earcut": "^3.2.3",
+    "js-indexus-sdk": "file:../sdk-js",
+    "maplibre-gl": "^5.24.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.3",
+    "concurrently": "^9.1.0",
+    "vite": "^5.4.10"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
