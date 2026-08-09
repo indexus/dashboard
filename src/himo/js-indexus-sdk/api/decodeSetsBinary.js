@@ -19,7 +19,7 @@ import { parseSetMap } from "./parseSetMap.js";
 export const SETS_BINARY_PROPERTY_COUNT = 4;
 
 /** Inverse of metricInt scaling in go-indexus-core/http/p2p/p2p.go */
-export const DEFAULT_SETS_METRIC_DECODE = [
+const DEFAULT_SETS_METRIC_DECODE = [
   { propIndex: 1, metricIndex: 2, divisor: 1 },
   { propIndex: 2, metricIndex: 3, divisor: 1_000_000 },
   { propIndex: 3, metricIndex: 4, divisor: 1_000_000 },
@@ -37,7 +37,7 @@ function readU32BE(u8, offset) {
 /**
  * Decode `count` unsigned integers packed `bitsPerValue` wide (MSB-first), Go encodeBits order.
  */
-export function decodePackedInts(u8, offset, count, bitsPerValue) {
+function decodePackedInts(u8, offset, count, bitsPerValue) {
   if (bitsPerValue <= 0) {
     return { values: new Array(count).fill(0), bytesConsumed: 0 };
   }
@@ -136,7 +136,7 @@ export function decodeSetsBinary(buffer, options = {}) {
   return { blocks, propertyCount };
 }
 
-export function buildMetricsRow(columns, rowIndex, decodeRules = DEFAULT_SETS_METRIC_DECODE) {
+function buildMetricsRow(columns, rowIndex, decodeRules = DEFAULT_SETS_METRIC_DECODE) {
   const metrics = [];
   for (let r = 0; r < decodeRules.length; r++) {
     const rule = decodeRules[r];

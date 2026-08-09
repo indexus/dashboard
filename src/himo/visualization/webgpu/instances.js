@@ -12,6 +12,8 @@ export class InstanceBuffer {
     this.device = device;
     this.buffer = null;
     this.capacity = 0;
+    this.lastData = null;
+    this.lastCount = 0;
   }
 
   ensureCapacity(instanceCount) {
@@ -30,6 +32,7 @@ export class InstanceBuffer {
   uploadPacked(packed) {
     if (!packed || !packed.data || packed.count <= 0) return 0;
     const n = packed.count;
+    if (packed.data === this.lastData && n === this.lastCount) return n;
     this.ensureCapacity(n);
     this.device.queue.writeBuffer(
       this.buffer,
@@ -38,6 +41,8 @@ export class InstanceBuffer {
       packed.data.byteOffset,
       n * BYTES_PER_INSTANCE
     );
+    this.lastData = packed.data;
+    this.lastCount = n;
     return n;
   }
 
@@ -45,5 +50,7 @@ export class InstanceBuffer {
     if (this.buffer) this.buffer.destroy();
     this.buffer = null;
     this.capacity = 0;
+    this.lastData = null;
+    this.lastCount = 0;
   }
 }

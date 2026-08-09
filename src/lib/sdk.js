@@ -232,32 +232,44 @@ export class SearchSession {
     this._ready = null;
   }
 
+  get network() {
+    return this._network;
+  }
+
+  /** Connect Network + Local (idempotent). Safe to call before first search. */
+  ensure() {
+    return this._ensure();
+  }
+
+  _buildLocal() {
+    const { space, gps } = buildCollection(this.collectionName);
+    const output = {
+      send: (results) => {
+        for (const r of results) this._batch.push(r);
+      },
+    };
+    const monitoring = { send: () => {} };
+    const options = {
+      cap: 1,
+      step: this.step,
+      origins: { gps: gps.newPoint([this.lat, this.lng]) },
+      filters: { gps: gps.newFilter([0, 0], [0, 360]) },
+    };
+    this._local = new Local(
+      { [this.collectionName]: space },
+      options,
+      output,
+      monitoring,
+      this._network,
+    );
+  }
+
   async _ensure() {
     if (this._ready) return this._ready;
     this._ready = (async () => {
       await ensureToken();
-      const { space, gps } = buildCollection(this.collectionName);
       this._network = await connect(this.hosts, this.readOptions);
-
-      const output = {
-        send: (results) => {
-          for (const r of results) this._batch.push(r);
-        },
-      };
-      const monitoring = { send: () => {} };
-      const options = {
-        cap: 1,
-        step: this.step,
-        origins: { gps: gps.newPoint([this.lat, this.lng]) },
-        filters: { gps: gps.newFilter([0, 0], [0, 360]) },
-      };
-      this._local = new Local(
-        { [this.collectionName]: space },
-        options,
-        output,
-        monitoring,
-        this._network,
-      );
+      this._buildLocal();
       return {
         peers: this._network.listPeers().length,
         hosts: this.hosts,
@@ -267,46 +279,38 @@ export class SearchSession {
   }
 
   /**
+   * Fresh Query: rebuild Local on the same Network so Nodes/Metrics stay live.
+   */
+  async resetLocal() {
+    await this._ensure();
+    this._batch = [];
+    this._buildLocal();
+  }
+
+  /**
    * Run one Local.search() advancing by `step` nearest items.
+   * @param {number} [step]
+   * @param {{ fresh?: boolean }} [opts] - when true, rebuild Local (Query)
    * @returns {Promise<{ items: ReturnType<typeof summarizeItem>[], peers: number, hosts: string[] }>}
    */
-  async search(step = this.step) {
-    const meta = await this._ensure();
+  async search(step = this.step, opts = {}) {
     this.step = step;
-    if (this._local?.options) this._local.options.step = step;
+    if (opts.fresh && this._network) {
+      await this.resetLocal();
+    } else {
+      await this._ensure();
+      if (this._local?.options) this._local.options.step = step;
+    }
     this._batch = [];
     await this._local.search();
     const origin = { lat: this.lat, lng: this.lng };
     const items = this._batch.map((r, i) => summarizeItem(r, i + 1, origin));
-    return { items, peers: meta.peers, hosts: meta.hosts };
+    return {
+      items,
+      peers: this._network?.listPeers?.().length ?? 0,
+      hosts: this.hosts,
+    };
   }
-}
-
-/**
- * @deprecated use SearchSession — kept for one-shot callers
- */
-export async function searchNearest({
-  collectionName,
-  hosts,
-  bootHost,
-  lat,
-  lng,
-  step,
-  session,
-}) {
-  const resolvedHosts = hosts?.length ? hosts : bootHost ? [bootHost] : [];
-  let sess = session;
-  if (!sess) {
-    sess = new SearchSession({
-      collectionName,
-      hosts: resolvedHosts,
-      lat,
-      lng,
-      step,
-    });
-  }
-  const { items } = await sess.search(step);
-  return { items, session: sess, local: sess };
 }
 
 export async function addGeoItem({

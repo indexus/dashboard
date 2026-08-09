@@ -9,7 +9,7 @@ const MAGIC = new Uint8Array([0x49, 0x58, 0x53, 0x31]); // IXS1
  * @param {Uint8Array} u8
  * @returns {boolean}
  */
-export function isSetsEnvelope(u8) {
+function isSetsEnvelope(u8) {
   return (
     u8 instanceof Uint8Array &&
     u8.byteLength >= 4 &&

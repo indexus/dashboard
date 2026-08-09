@@ -10,6 +10,7 @@ import { SetsCoalescePool } from "./setsCoalescePool.js";
 import { ReadMetrics } from "./readMetrics.js";
 import { abelianTotal } from "../entities/abelian.js";
 import { debugEnabled, debugLog, signed } from "../utilities/debug.js";
+import { putLru, touchLru } from "../utilities/lru.js";
 
 /** @typedef {"ingress" | "direct"} ReadNavigation */
 /** @typedef {"getSet" | "getSets"} ReadMethod */
@@ -497,27 +498,7 @@ class Network extends BaseNetwork {
     const ip = meta.ip ?? (peer ? peer.ip() : null);
     const port = meta.port ?? (peer ? peer.port() : null);
     const hash = meta.hash ?? (peer ? peer.hash() : null);
-    const event = {
-      phase,
-      method: meta.method,
-      hash,
-      ip,
-      port,
-      host: meta.host ?? (ip != null ? `${ip}|${port}` : null),
-      ok: meta.ok,
-      ms: meta.ms,
-      collection: meta.collection,
-      location: meta.location,
-      locations: meta.locations,
-      navigation: meta.navigation,
-      refresh: meta.refresh,
-      deep: meta.deep,
-      redirects: meta.redirects,
-      reason: meta.reason,
-      bytes: meta.bytes,
-      wireBytes: meta.wireBytes,
-      rows: meta.rows,
-    };
+    const host = meta.host ?? (ip != null ? `${ip}|${port}` : null);
 
     if (meta.method === "getSets") {
       const locs = meta.locations ?? (meta.location ? [meta.location] : []);
@@ -549,7 +530,7 @@ class Network extends BaseNetwork {
           phase === "start" ? "wire request" : "wire response",
           {
             peer: hash,
-            host: event.host,
+            host,
             locations: locs,
             navigation: meta.navigation ?? this._readNavigation,
             refresh: meta.refresh === true,
@@ -564,6 +545,27 @@ class Network extends BaseNetwork {
     }
 
     if (typeof this._onActivity !== "function") return;
+    const event = {
+      phase,
+      method: meta.method,
+      hash,
+      ip,
+      port,
+      host,
+      ok: meta.ok,
+      ms: meta.ms,
+      collection: meta.collection,
+      location: meta.location,
+      locations: meta.locations,
+      navigation: meta.navigation,
+      refresh: meta.refresh,
+      deep: meta.deep,
+      redirects: meta.redirects,
+      reason: meta.reason,
+      bytes: meta.bytes,
+      wireBytes: meta.wireBytes,
+      rows: meta.rows,
+    };
     try {
       this._onActivity(event);
     } catch {
@@ -800,13 +802,7 @@ class Network extends BaseNetwork {
    */
   _rememberOwner(cacheKey, peer) {
     if (!peer) return;
-    // Re-insert to keep the map ordered oldest-first for eviction.
-    this._owners.delete(cacheKey);
-    this._owners.set(cacheKey, peer);
-    if (this._owners.size > this._ownersMax) {
-      const oldest = this._owners.keys().next().value;
-      this._owners.delete(oldest);
-    }
+    putLru(this._owners, cacheKey, peer, this._ownersMax);
   }
 
   /**
@@ -854,13 +850,7 @@ class Network extends BaseNetwork {
    * @returns {any[] | undefined}
    */
   _touchCacheEntry(cacheKey) {
-    if (!this._cache.has(cacheKey)) {
-      return undefined;
-    }
-    const cached = this._cache.get(cacheKey);
-    this._cache.delete(cacheKey);
-    this._cache.set(cacheKey, cached);
-    return cached;
+    return touchLru(this._cache, cacheKey);
   }
 
   /**
@@ -868,12 +858,9 @@ class Network extends BaseNetwork {
    * @param {any[]} bucket
    */
   _putCacheChildren(cacheKey, bucket) {
-    if (!this._cache.has(cacheKey) && this._cache.size >= this._cacheSize) {
-      const firstKey = this._cache.keys().next().value;
-      this._cache.delete(firstKey);
-      this._cacheFetchedAt.delete(firstKey);
-    }
-    this._cache.set(cacheKey, bucket);
+    putLru(this._cache, cacheKey, bucket, this._cacheSize, (evicted) => {
+      this._cacheFetchedAt.delete(evicted);
+    });
     this._cacheFetchedAt.set(cacheKey, Date.now());
   }
 
@@ -1004,15 +991,17 @@ class Network extends BaseNetwork {
             status === null ? " (unreachable)" : ` (HTTP ${status})`
           }. Retrying with a different peer...`
         );
-        debugLog("sets", "peer dropped for this read", {
-          peer: peer.hash(),
-          status,
-          blacklisted: status === null,
-          locations: stillMissing.length,
-          first: stillMissing[0],
-          attemptsLeft: attempts - 1,
-          navigation: "ingress",
-        });
+        if (debugEnabled("sets")) {
+          debugLog("sets", "peer dropped for this read", {
+            peer: peer.hash(),
+            status,
+            blacklisted: status === null,
+            locations: stillMissing.length,
+            first: stillMissing[0],
+            attemptsLeft: attempts - 1,
+            navigation: "ingress",
+          });
+        }
 
         attempts--;
         if (attempts === 0) {
@@ -1138,32 +1127,34 @@ class Network extends BaseNetwork {
       for (const location of locations) {
         const state = pending.get(location);
         if (!state) continue;
+        const cacheKey = zoneKey(collection, location);
         state.via.add(peer.hash());
 
         const bucket = byParent.get(location) ?? [];
         if (bucket.length > 0) {
           if (refresh) {
-            const before = this._cache.get(zoneKey(collection, location));
+            const before = this._cache.get(cacheKey);
             // Skip "was: 0" noise from cold fills / prior invalidate — only
             // report a real move when we had a previous cached answer.
             if (before !== undefined) {
-              const delta =
-                abelianTotal(bucket).count - abelianTotal(before).count;
+              const beforeCount = abelianTotal(before).count;
+              const afterCount = abelianTotal(bucket).count;
+              const delta = afterCount - beforeCount;
               if (delta !== 0) {
                 this._metrics.onZoneDelta(location, delta);
                 if (debugEnabled("refresh")) {
                   debugLog("refresh", "zone moved", {
                     location,
-                    was: abelianTotal(before).count,
-                    now: abelianTotal(bucket).count,
+                    was: beforeCount,
+                    now: afterCount,
                     delta: signed(delta),
                   });
                 }
               }
             }
           }
-          this._putCacheChildren(zoneKey(collection, location), bucket);
-          this._rememberOwner(zoneKey(collection, location), peer);
+          this._putCacheChildren(cacheKey, bucket);
+          this._rememberOwner(cacheKey, peer);
           pending.delete(location);
           continue;
         }
@@ -1171,7 +1162,7 @@ class Network extends BaseNetwork {
         const redirect = redirectByLoc.get(location);
         if (redirect && redirect.name && redirect.port > 0) {
           if (state.via.has(redirect.name)) {
-            this._putCacheChildren(zoneKey(collection, location), []);
+            this._putCacheChildren(cacheKey, []);
             pending.delete(location);
             continue;
           }
@@ -1186,13 +1177,15 @@ class Network extends BaseNetwork {
             state.peer = next;
             this._notifyPeers();
             this._metrics.onRedirectFollow();
-            debugLog("sets", "direct redirect follow", {
-              location,
-              from: peer.hash(),
-              to: redirect.name,
-              toHost: `${redirect.ip}|${redirect.port}`,
-              via: [...state.via],
-            });
+            if (debugEnabled("sets")) {
+              debugLog("sets", "direct redirect follow", {
+                location,
+                from: peer.hash(),
+                to: redirect.name,
+                toHost: `${redirect.ip}|${redirect.port}`,
+                via: [...state.via],
+              });
+            }
             continue;
           } catch {
             /* fall through to parent probe */
@@ -1201,13 +1194,13 @@ class Network extends BaseNetwork {
 
         // Parent-key peer fallback while still requesting the original location.
         if (state.probe === ROOT) {
-          this._putCacheChildren(zoneKey(collection, location), []);
+          this._putCacheChildren(cacheKey, []);
           pending.delete(location);
           continue;
         }
         const nextProbe = parent(state.probe);
         if (!nextProbe) {
-          this._putCacheChildren(zoneKey(collection, location), []);
+          this._putCacheChildren(cacheKey, []);
           pending.delete(location);
           continue;
         }
@@ -1227,12 +1220,14 @@ class Network extends BaseNetwork {
         state.via.add(peer.hash());
         state.peer = null;
       }
-      debugLog("sets", "direct peer dropped", {
-        peer: peer.hash(),
-        status,
-        locations: locations.length,
-        first: locations[0],
-      });
+      if (debugEnabled("sets")) {
+        debugLog("sets", "direct peer dropped", {
+          peer: peer.hash(),
+          status,
+          locations: locations.length,
+          first: locations[0],
+        });
+      }
     }
   }
 

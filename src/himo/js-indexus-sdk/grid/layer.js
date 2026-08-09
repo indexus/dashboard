@@ -40,13 +40,6 @@ export function project(zoom, bounds) {
   for (let z = 0; z <= zoomMax; z++) {
     let boundsAtZoom = currentBounds;
 
-    // if (z < currentZoom) {
-    //   const steps = currentZoom - z;
-    //   for (let s = 0; s < steps; s++) {
-    //     boundsAtZoom = this.space.extend(boundsAtZoom, 0.5);
-    //   }
-    // }
-
     if (z > currentZoom) {
       const steps = z - currentZoom;
       for (let s = 0; s < steps; s++) {
@@ -237,14 +230,16 @@ export async function refresh(id, list, bounds, depth, current = 0) {
       if (!list[i]._items) total++;
     }
 
-    this.monitoring.send(
-      new Monitoring(current, State.Refresh, {
-        id: id,
-        depth: current,
-        bounds: bounds[current],
-        size: total,
-      })
-    );
+    if (this.monitoring?.enabled !== false) {
+      this.monitoring.send(
+        new Monitoring(current, State.Refresh, {
+          id: id,
+          depth: current,
+          bounds: bounds[current],
+          size: total,
+        })
+      );
+    }
 
     if (id === this.current.id) {
       if (selected.length > 0 && current < depth) {
@@ -481,7 +476,7 @@ function elementLocation(element) {
  * @param {any} [boundsHint]
  * @returns {string}
  */
-export function cellLocation(space, cell, boundsHint) {
+function cellLocation(space, cell, boundsHint) {
   if (!cell) return ROOT;
   if (typeof cell === "string") return cell;
   if (cell.hash) return cell.hash;

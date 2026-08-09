@@ -31,15 +31,12 @@ export async function createPolygonWasm() {
     return ptr;
   }
 
-  function allocateDoubleArray(values) {
-    const bytes = values.length * Float64Array.BYTES_PER_ELEMENT;
-    const ptr = wasm._malloc(bytes);
-    if (ptr === 0) throw new Error("WASM malloc failed (double[])");
-    new Float64Array(wasm.HEAPU8.buffer, ptr, values.length).set(values);
-    return ptr;
-  }
-
   let polygonPtr = null;
+  // `covers` is called once per visited cube cell. Keep one four-double
+  // scratch allocation for the runtime lifetime instead of malloc/free per
+  // cell; recreating the view remains safe if Emscripten grows its heap.
+  const boundsPtr = wasm._malloc(4 * Float64Array.BYTES_PER_ELEMENT);
+  if (boundsPtr === 0) throw new Error("WASM malloc failed (bounds scratch)");
 
   return {
     loadGeojson(geojson) {
@@ -58,10 +55,13 @@ export async function createPolygonWasm() {
     isCovered(cell) {
       if (polygonPtr === null) return false;
       const b = cell.bounds[0];
-      const ptr = allocateDoubleArray([b.south, b.west, b.north, b.east]);
-      const result = coversFn(polygonPtr, ptr);
-      wasm._free(ptr);
-      return Boolean(result);
+      new Float64Array(wasm.HEAPU8.buffer, boundsPtr, 4).set([
+        b.south,
+        b.west,
+        b.north,
+        b.east,
+      ]);
+      return Boolean(coversFn(polygonPtr, boundsPtr));
     },
   };
 }

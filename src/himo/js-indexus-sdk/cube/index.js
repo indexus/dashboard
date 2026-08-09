@@ -25,10 +25,6 @@ class Cube {
     this.root = space.xyz("@");
   }
 
-  adjust(zoom) {
-    return Math.floor(zoom + this.options.resolution);
-  }
-
   display(zoom, bounds) {
     const z = Math.floor(zoom + this.options.resolution);
     const depth = Math.floor(z / this.space.step);

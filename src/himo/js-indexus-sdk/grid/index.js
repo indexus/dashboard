@@ -2,7 +2,8 @@ import { Set } from "../entities/set.js";
 import { createStreamCoalescer } from "./streamCoalescer.js";
 import { createArrayPool, createSetPool } from "../utilities/bufferPool.js";
 import { createGpuOverlapAccelerator } from "../utilities/gpuOverlap.js";
-import { ROOT, zoneKey } from "../utilities/encoding.js";
+import { ROOT } from "../utilities/encoding.js";
+import { putLru, touchLru } from "../utilities/lru.js";
 
 import { project, refresh, consolidate, process, reconcileVisible } from "./layer.js";
 
@@ -13,8 +14,7 @@ import { project, refresh, consolidate, process, reconcileVisible } from "./laye
  * - `network._cache` — raw `/sets` children keyed by zoneKey (wire shape).
  * - `grid.cache` — geometry-enriched processed children for the drill.
  *
- * Invalidating one without the other leaves stale half-state; use
- * {@link invalidateZone} when dropping a zone from both.
+ * The Network and Grid caches deliberately keep different shapes.
  */
 class Grid {
   constructor(collection, space, options, stream, finish, monitoring, network) {
@@ -63,11 +63,19 @@ class Grid {
       ? Math.max(0, Math.floor(streamOptions.flushMs))
       : defaultFlushMs;
 
-    this.stream = createStreamCoalescer({
-      minBatch,
-      flushMs,
-      applyBatch: (elements) => this.streamOutput(elements),
-    });
+    // Progressive Aggregate wants every processed zone immediately. Avoid
+    // allocating a second buffer/timer only to flush it on the next line in
+    // process(); the worker remains the single ingest owner.
+    this.stream = streamProgressive
+      ? {
+          enqueue: (elements) => this.streamOutput(elements),
+          flushNow() {},
+        }
+      : createStreamCoalescer({
+          minBatch,
+          flushMs,
+          applyBatch: (elements) => this.streamOutput(elements),
+        });
   }
 
   /**
@@ -101,23 +109,15 @@ class Grid {
   }
 
   getGeometry(location) {
-    if (this.geometryCache.has(location)) {
-      const cached = this.geometryCache.get(location);
-      this.geometryCache.delete(location);
-      this.geometryCache.set(location, cached);
-      return cached;
-    }
+    const cached = touchLru(this.geometryCache, location);
+    if (cached !== undefined) return cached;
 
     const geometry = {
       bounds: this.space.decode(location),
       xyz: this.space.xyz(location),
     };
 
-    if (this.geometryCache.size >= this.geometryCacheSize) {
-      const firstKey = this.geometryCache.keys().next().value;
-      this.geometryCache.delete(firstKey);
-    }
-    this.geometryCache.set(location, geometry);
+    putLru(this.geometryCache, location, geometry, this.geometryCacheSize);
     return geometry;
   }
 
@@ -126,11 +126,7 @@ class Grid {
    * @param {string} key
    */
   getProcessed(key) {
-    if (!this.cache.has(key)) return undefined;
-    const cached = this.cache.get(key);
-    this.cache.delete(key);
-    this.cache.set(key, cached);
-    return cached;
+    return touchLru(this.cache, key);
   }
 
   /**
@@ -138,34 +134,9 @@ class Grid {
    * @param {any[]} elements
    */
   putProcessed(key, elements) {
-    if (!this.cache.has(key) && this.cache.size >= this.cacheSize) {
-      this.cache.delete(this.cache.keys().next().value);
-    }
-    this.cache.set(key, elements);
+    putLru(this.cache, key, elements, this.cacheSize);
   }
 
-  /**
-   * Drop the processed-children cache entry for one zone.
-   * @param {string} collection
-   * @param {string} location
-   */
-  invalidate(collection, location) {
-    if (collection == null || location == null) return;
-    this.cache.delete(zoneKey(collection, location));
-  }
-}
-
-/**
- * Drop a zone from Network wire cache and Grid processed cache together.
- * @param {{ invalidate?: Function } | null | undefined} network
- * @param {{ invalidate?: Function } | null | undefined} grid
- * @param {string} collection
- * @param {string} location
- */
-export function invalidateZone(network, grid, collection, location) {
-  if (collection == null || location == null) return;
-  network?.invalidate?.(collection, location);
-  grid?.invalidate?.(collection, location);
 }
 
 Grid.prototype.project = project;

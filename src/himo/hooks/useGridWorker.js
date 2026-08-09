@@ -54,27 +54,13 @@ const POINT_COLOR_THRESHOLD = 200;
 // short grace keeps the heatmap visible across that gap, then we let
 // the empty pack through if the gap persists (genuinely-empty viewport).
 const EMPTY_PACK_GRACE_MS = 300;
-/** himo.place paints as soon as the first PACKED arrives (0). A multi-second
- *  gate hid early transition blends and made Aggregate look slower than himo. */
-const INITIAL_LOD_REVEAL_MS = 0;
 const NOOP = () => {};
 const EMPTY_PACKED = { count: 0, data: null, snapshotVersion: 0 };
 
-/** Point overlay as seen by the map — hidden during the initial LOD settle. */
-function gatedPointOverlay(overlay, revealAtRef) {
-  if (!overlay) return overlay;
-  if (performance.now() < (revealAtRef?.current || 0)) {
-    if (!overlay.enabled) return overlay;
-    return { ...overlay, enabled: false };
-  }
-  return overlay;
-}
-
 function notifyPointSubscribers(ctx, overlay) {
-  const visible = gatedPointOverlay(overlay, ctx.revealAtRef);
   for (const subscriber of ctx.pointSubscribersRef.current) {
     try {
-      subscriber(visible);
+      subscriber(overlay);
     } catch (_) {
       /* ignore */
     }
@@ -165,9 +151,6 @@ export function useGridWorker({
   // `now + EMPTY_PACK_GRACE_MS` every time a non-empty pack arrives, so
   // the window only opens after we've actually had something to hold on to.
   const emptyPackGraceUntilRef = useRef(0);
-  /** performance.now() until which heatmap + points stay hidden (initial LOD settle). */
-  const revealAtRef = useRef(0);
-  const revealTimerRef = useRef(null);
   const effectRef = useRef(effect);
   const normalizerRef = useRef(normalizer);
   const resolutionRef = useRef(
@@ -240,23 +223,6 @@ export function useGridWorker({
     workerRef.current = worker;
     latestNetworkRef.current = { peers: [], activity: null, metrics: null };
 
-    // Gate the first paint until coarse parent sets have had time to
-    // subdivide toward the configured resolution / zone threshold.
-    if (revealTimerRef.current != null) {
-      clearTimeout(revealTimerRef.current);
-      revealTimerRef.current = null;
-    }
-    revealAtRef.current = performance.now() + INITIAL_LOD_REVEAL_MS;
-    revealTimerRef.current = window.setTimeout(() => {
-      revealTimerRef.current = null;
-      revealAtRef.current = 0;
-      notifyPointSubscribers(
-        { pointSubscribersRef, revealAtRef },
-        latestPointsRef.current,
-      );
-      repaintRef.current();
-    }, INITIAL_LOD_REVEAL_MS);
-
     worker.onmessage = (event) =>
       handleWorkerMessage(event, {
         latestPackedRef,
@@ -265,7 +231,6 @@ export function useGridWorker({
         networkSubscribersRef,
         latestNetworkRef,
         emptyPackGraceUntilRef,
-        revealAtRef,
         normalizerRef,
         resolutionRef,
         transitionRef,
@@ -303,10 +268,6 @@ export function useGridWorker({
     });
 
     return () => {
-      if (revealTimerRef.current != null) {
-        clearTimeout(revealTimerRef.current);
-        revealTimerRef.current = null;
-      }
       worker.terminate();
       workerRef.current = null;
     };
@@ -429,7 +390,7 @@ export function useGridWorker({
         stats: { ...cur.stats, normalizer: n },
       };
       notifyPointSubscribers(
-        { pointSubscribersRef, revealAtRef },
+        { pointSubscribersRef },
         latestPointsRef.current,
       );
     }
@@ -443,12 +404,8 @@ export function useGridWorker({
     effectRef.current = nextEffect;
     repaintRef.current();
   }, []);
-  const getPointOverlay = useCallback(
-    () => gatedPointOverlay(latestPointsRef.current, revealAtRef),
-    [],
-  );
+  const getPointOverlay = useCallback(() => latestPointsRef.current, []);
   const getHeatmapOpacity = useCallback(() => {
-    if (performance.now() < revealAtRef.current) return 0;
     const overlay = latestPointsRef.current;
     if (overlay?.enabled && overlay?.stats?.mode === "points") {
       return 0;
@@ -459,7 +416,7 @@ export function useGridWorker({
     if (typeof handler !== "function") return NOOP;
     const subscribers = pointSubscribersRef.current;
     subscribers.add(handler);
-    handler(gatedPointOverlay(latestPointsRef.current, revealAtRef));
+    handler(latestPointsRef.current);
     return () => subscribers.delete(handler);
   }, []);
   const subscribeNetwork = useCallback((handler) => {

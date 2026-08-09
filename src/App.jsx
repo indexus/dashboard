@@ -8,7 +8,10 @@ import DataSidePanel, {
   HitsList,
   NearbyControls,
 } from "./components/DataSidePanel.jsx";
+import NodesList from "./components/NodesList.jsx";
+import ClientMetrics from "./components/ClientMetrics.jsx";
 import { getHealth, getMesh } from "./lib/api.js";
+import { attachNetworkController } from "./lib/networkController.js";
 import {
   addGeoItem,
   bootstrapHost,
@@ -56,7 +59,7 @@ export default function App() {
     DEFAULT_READ_OPTIONS.navigation,
   );
   const [readMethod, setReadMethod] = useState(DEFAULT_READ_OPTIONS.method);
-  const [detailLimit] = useState(DETAIL_LIMIT);
+  const detailLimit = DETAIL_LIMIT;
   const [origin, setOrigin] = useState({ lat: 48.8566, lng: 2.3522 });
   const [itemId, setItemId] = useState("");
   const [hits, setHits] = useState([]);
@@ -83,6 +86,12 @@ export default function App() {
   const originKeyRef = useRef("");
   const autoTimerRef = useRef(null);
   const searchGenRef = useRef(0);
+  const nearbyNetDisposeRef = useRef(null);
+  /** One-shot: run first Nearby Query after picking the mode. */
+  const nearbyBootRef = useRef(false);
+  const [nearbyController, setNearbyController] = useState(null);
+  const [nearbyNodeCount, setNearbyNodeCount] = useState(0);
+  const [nearbyMetricsHint, setNearbyMetricsHint] = useState(null);
   /** Last Aggregate / Nearby camera — Refresh remounts without jumping to default. */
   const mapViewportRef = useRef({
     aggregate: { center: [2.3522, 48.8566], zoom: 6 },
@@ -261,6 +270,76 @@ export default function App() {
     }
   }, [collection, origin.lat, origin.lng, mode]);
 
+  // Eager Nearby Network so Nodes / Metrics match Aggregate before first Query.
+  useEffect(() => {
+    if (mode !== "nearby" || !hosts.length || tab !== "data") {
+      nearbyNetDisposeRef.current?.();
+      nearbyNetDisposeRef.current = null;
+      setNearbyController(null);
+      setNearbyNodeCount(0);
+      setNearbyMetricsHint(null);
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        if (!sessionRef.current) {
+          sessionRef.current = new SearchSession({
+            collectionName: collection,
+            hosts,
+            lat: origin.lat,
+            lng: origin.lng,
+            step,
+            readOptions,
+          });
+        }
+        await sessionRef.current.ensure();
+        if (cancelled) return;
+        const net = sessionRef.current.network;
+        if (!net) return;
+        nearbyNetDisposeRef.current?.();
+        const ctrl = attachNetworkController(net);
+        nearbyNetDisposeRef.current = () => ctrl.dispose();
+        setNearbyController(ctrl);
+      } catch (e) {
+        if (cancelled) return;
+        setNearbyController(null);
+        setNearbyNodeCount(0);
+        setNearbyMetricsHint(null);
+        setDataErr(true);
+        setDataStatus(e.message || String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      nearbyNetDisposeRef.current?.();
+      nearbyNetDisposeRef.current = null;
+    };
+  }, [
+    mode,
+    tab,
+    hosts,
+    collection,
+    origin.lat,
+    origin.lng,
+    readOptions,
+    dataEpoch,
+  ]);
+
+  useEffect(() => {
+    if (!nearbyController?.subscribeNetwork) return undefined;
+    return nearbyController.subscribeNetwork((snap) => {
+      setNearbyNodeCount(Array.isArray(snap?.peers) ? snap.peers.length : 0);
+      const cached = snap?.metrics?.cacheSize;
+      setNearbyMetricsHint(
+        Number.isFinite(cached) && cached > 0 ? String(cached) : null,
+      );
+    });
+  }, [nearbyController]);
+
   const onAggStatus = useCallback((msg) => {
     setDataStatus(msg);
     setDataErr(false);
@@ -289,7 +368,7 @@ export default function App() {
           : `query ${step} nearest via ${hosts.length} host(s)…`,
       );
       try {
-        if (!next || !sessionRef.current) {
+        if (!sessionRef.current) {
           sessionRef.current = new SearchSession({
             collectionName: collection,
             hosts,
@@ -298,9 +377,11 @@ export default function App() {
             step,
             readOptions,
           });
-          cumulativeRef.current = [];
         }
-        const { items, peers } = await sessionRef.current.search(step);
+        if (!next) cumulativeRef.current = [];
+        const { items, peers } = await sessionRef.current.search(step, {
+          fresh: !next,
+        });
         if (gen !== searchGenRef.current) return;
         setCanNext(items.length > 0);
         const ranked = items.map((it, i) => ({
@@ -321,7 +402,12 @@ export default function App() {
         if (gen !== searchGenRef.current) return;
         setDataErr(true);
         setDataStatus(e.message || String(e));
-        if (!next) sessionRef.current = null;
+        if (!next) {
+          sessionRef.current = null;
+          nearbyNetDisposeRef.current?.();
+          nearbyNetDisposeRef.current = null;
+          setNearbyController(null);
+        }
       } finally {
         if (gen === searchGenRef.current) setBusy(false);
       }
@@ -354,6 +440,18 @@ export default function App() {
     tab,
     runSearch,
   ]);
+
+  // First Nearby round as soon as the mode is picked (hosts + Data tab ready).
+  useEffect(() => {
+    if (!nearbyBootRef.current) return;
+    if (mode !== "nearby" || tab !== "data" || !hosts.length) return;
+    nearbyBootRef.current = false;
+    if (auto) return; // auto effect already queries on entry
+    const t = setTimeout(() => {
+      runSearch(false);
+    }, 50);
+    return () => clearTimeout(t);
+  }, [mode, tab, hosts, auto, runSearch]);
 
   async function onAdd() {
     if (!hosts.length) {
@@ -417,11 +515,12 @@ export default function App() {
     setSelectedCell(null);
     setHoveredHit(null);
     setSideView(next === "nearby" ? "items" : "controls");
+    nearbyBootRef.current = next === "nearby";
     setDataStatus(
       next === "nearby"
         ? auto
-          ? "auto nearby · click map to set origin"
-          : "nearby · Query / Next"
+          ? "auto nearby · querying…"
+          : "nearby · querying…"
         : "aggregate · WebGPU heatmap · pan / zoom",
     );
   }
@@ -507,6 +606,8 @@ export default function App() {
                   onView={setSideView}
                   onAddClick={() => setAddOpen(true)}
                   itemCount={displayHits.length}
+                  nodeCount={nearbyNodeCount}
+                  metricsHint={nearbyMetricsHint}
                   controls={
                     <NearbyControls
                       origin={origin}
@@ -534,6 +635,8 @@ export default function App() {
                       loadingMore={busy}
                     />
                   }
+                  nodes={<NodesList controller={nearbyController} />}
+                  metrics={<ClientMetrics controller={nearbyController} />}
                 />
               </>
             )}

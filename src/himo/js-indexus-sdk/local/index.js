@@ -35,18 +35,6 @@ class Local {
     }
   }
 
-  dimensions() {
-    const dimensions = {};
-    for (const key in this.spaces) {
-      const space = this.spaces[key];
-      for (let i = 0; i < space.dimensions.length; i++) {
-        const dimension = space.dimension(i);
-        dimensions[dimension.name()] = dimension;
-      }
-    }
-    return dimensions;
-  }
-
   async search() {
     this.limit += this.options.step;
     await this.run();

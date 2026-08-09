@@ -253,7 +253,6 @@ function HimoHeatmapMap({
   onRegisterRepaint,
   onPolygonLoaded,
   onPointClick,
-  onPointHover,
   fullscreenContainerRef,
 }) {
   const containerRef = useRef(null);
@@ -267,7 +266,6 @@ function HimoHeatmapMap({
   const onRegisterRepaintRef = useRef(onRegisterRepaint);
   const onPolygonLoadedRef = useRef(onPolygonLoaded);
   const onPointClickRef = useRef(onPointClick);
-  const onPointHoverRef = useRef(onPointHover);
   const unsubscribePointsRef = useRef(null);
   const hoverPopupRef = useRef(null);
 
@@ -277,14 +275,12 @@ function HimoHeatmapMap({
     onRegisterRepaintRef.current = onRegisterRepaint;
     onPolygonLoadedRef.current = onPolygonLoaded;
     onPointClickRef.current = onPointClick;
-    onPointHoverRef.current = onPointHover;
   }, [
     onMove,
     averageGridController,
     onRegisterRepaint,
     onPolygonLoaded,
     onPointClick,
-    onPointHover,
   ]);
 
   useEffect(() => {
@@ -406,7 +402,6 @@ function HimoHeatmapMap({
         const hideHoverPopup = () => {
           hoverPopupRef.current?.remove();
           hoverPopupRef.current = null;
-          onPointHoverRef.current?.(null);
           map.getCanvas().style.cursor = "";
         };
 
@@ -428,7 +423,6 @@ function HimoHeatmapMap({
             return;
           }
           map.getCanvas().style.cursor = "pointer";
-          onPointHoverRef.current?.(hit);
           if (!hoverPopupRef.current) {
             hoverPopupRef.current = new maplibregl.Popup({
               closeButton: false,
@@ -506,7 +500,6 @@ export default function AggregateHeatmap({
   normalizer: normalizerProp,
   theme = "dark",
   onStatus,
-  onViewportStats,
   onAddClick,
   sideView = "controls",
   onSideView,
@@ -735,8 +728,12 @@ export default function AggregateHeatmap({
         next.avgEuroM2 > 0 &&
         Number.isFinite(next.avgSurfaceM2) &&
         next.avgSurfaceM2 > 0;
-      setMetricMode(hasPurchase ? "dvf" : "density");
-      setOverlayMode(stats.mode === "points" ? "points" : "heatmap");
+      const nextMetricMode = hasPurchase ? "dvf" : "density";
+      setMetricMode((prev) => (prev === nextMetricMode ? prev : nextMetricMode));
+      const nextOverlayMode = stats.mode === "points" ? "points" : "heatmap";
+      setOverlayMode((prev) =>
+        prev === nextOverlayMode ? prev : nextOverlayMode,
+      );
       const fromMetrics = Number.isFinite(stats.metricTotalCount)
         ? Math.round(stats.metricTotalCount)
         : 0;
@@ -746,7 +743,7 @@ export default function AggregateHeatmap({
       const fromDvf = Number.isFinite(stats.dvf?.transactions)
         ? Math.round(stats.dvf.transactions)
         : 0;
-      setVisibleItemCount(fromOverlay);
+      setVisibleItemCount((prev) => (prev === fromOverlay ? prev : fromOverlay));
       // Prefer viewport metric sum (visible parent zones); fall back to
       // DVF transactions then the heatmap↔points weighted gate count.
       const nextParentTotal =
@@ -754,18 +751,34 @@ export default function AggregateHeatmap({
       setParentItemTotal((prev) =>
         prev === nextParentTotal ? prev : nextParentTotal,
       );
-      setPointCount(
-        Number.isFinite(stats.renderedPointCount)
+      const nextPointCount = Number.isFinite(stats.renderedPointCount)
           ? stats.renderedPointCount
           : overlay?.points?.length
             ? Math.floor(overlay.points.length / 3)
-            : 0,
-      );
+            : 0;
+      setPointCount((prev) => (prev === nextPointCount ? prev : nextPointCount));
       if (stats.mode === "points" && overlay?.points?.length) {
-        setPointHits(pointsToHits(overlay.points, stats));
+        const nextHits = pointsToHits(overlay.points, stats);
+        setPointHits((prev) => {
+          if (prev.length !== nextHits.length) return nextHits;
+          for (let i = 0; i < prev.length; i++) {
+            const a = prev[i];
+            const b = nextHits[i];
+            if (
+              a.lng !== b.lng ||
+              a.lat !== b.lat ||
+              a.value !== b.value ||
+              a.metricIndex !== b.metricIndex ||
+              a.normalizer !== b.normalizer
+            ) {
+              return nextHits;
+            }
+          }
+          return prev;
+        });
       } else {
-        setPointHits([]);
-        setSelectedPoint(null);
+        setPointHits((prev) => (prev.length === 0 ? prev : []));
+        setSelectedPoint((prev) => (prev == null ? prev : null));
       }
     });
     return () => unsub?.();
@@ -782,31 +795,6 @@ export default function AggregateHeatmap({
     });
     return () => unsub?.();
   }, [controller]);
-
-  useEffect(() => {
-    onViewportStats?.({
-      instances,
-      metricMode,
-      normalizer,
-      dvf,
-      mapStyleMode,
-      overlayMode,
-      visibleItemCount,
-      parentItemTotal,
-      pointCount,
-    });
-  }, [
-    instances,
-    metricMode,
-    normalizer,
-    dvf,
-    mapStyleMode,
-    overlayMode,
-    visibleItemCount,
-    parentItemTotal,
-    pointCount,
-    onViewportStats,
-  ]);
 
   useEffect(() => {
     const itemsLabel =

@@ -6,5 +6,6 @@ Canonical Aggregate visualization for the dashboard, vendored from
 
 Import via Vite alias `@himo/*` → this directory.
 
-Nearby Data mode still uses the package `js-indexus-sdk` (`file:../sdk-js`).
-The copy under `js-indexus-sdk/` here is only for the Aggregate worker.
+Browser Nearby and Aggregate currently use the embedded SDK under
+`js-indexus-sdk/`. Node loaders use `js-indexus-sdk` via `file:../sdk-js`;
+`sdk-js` is the canonical synchronization target.

@@ -80,6 +80,16 @@ import {
   deltaTickCommit,
   shouldPruneAfterDeltaPass,
 } from "../lib/indexus/deltaTickRule.js";
+import { shouldArmDataDrivenTransition } from "../lib/indexus/transitionRule.js";
+import {
+  CELL_POSITION_MODE_BOUNDS,
+  CELL_POSITION_MODE_METRICS,
+  COLLECTION_DEFAULTS,
+  METRIC_SURFACE_BATI_INDEX,
+  METRIC_VALEUR_FONCIERE_INDEX,
+  ensureMetricCentroid,
+  normalizeCellPositionConfig,
+} from "../lib/heatmapConfig.js";
 import {
   setDebug,
   setDebugSink,
@@ -95,100 +105,6 @@ import { createPolygonWasm } from "./grid/polygonWasm";
 import { createStreamCoalescer } from "./grid/streamCoalescer";
 
 self.Buffer = Buffer; // js-indexus-sdk + axios expect a global Buffer
-
-// ----------------------------------------------------------------------------
-// Heatmap constants (moved from lib/heatmap)
-// ----------------------------------------------------------------------------
-
-const COLLECTION_DEFAULTS = {
-  valueMetricIndex: 2,
-  latMetricIndex: 3,
-  lngMetricIndex: 4,
-  metricScale: 1_000_000,
-  metricLatOffset: 90,
-  metricLngOffset: 180,
-  metricMaxIndex: 63,
-  normalizer: 10000,
-  pointOverlayMaxPoints: 1000,
-  cubeSubdivisionLimit: 5,
-  cubeChildrenThreshold: 4,
-  childVirtualizationEnabled: false,
-  algorithmResolution: 5,
-  parentFallbackDepth: 6,
-  heatmapVisualMultiplier: 2.5,
-  heatmapVisualAreaMode: 0,
-  heatmapVisualCentroidSnap: 0,
-  polygonDataFilterEnabled: true,
-  polygonVisualFilterEnabled: true,
-};
-
-const METRIC_VALEUR_FONCIERE_INDEX = 0;
-const METRIC_SURFACE_BATI_INDEX = 1;
-const METRIC_SCALE = COLLECTION_DEFAULTS.metricScale;
-const LAT_OFFSET = COLLECTION_DEFAULTS.metricLatOffset;
-const LNG_OFFSET = COLLECTION_DEFAULTS.metricLngOffset;
-const METRIC_MAX_INDEX = COLLECTION_DEFAULTS.metricMaxIndex;
-
-const CELL_POSITION_MODE_BOUNDS = "bounds";
-const CELL_POSITION_MODE_METRICS = "metrics";
-
-function normalizeCellPositionConfig(raw) {
-  const mode =
-    raw?.mode === CELL_POSITION_MODE_BOUNDS
-      ? CELL_POSITION_MODE_BOUNDS
-      : CELL_POSITION_MODE_METRICS;
-  let metricLatIndex = Number(raw?.metricLatIndex);
-  let metricLngIndex = Number(raw?.metricLngIndex);
-  if (!Number.isFinite(metricLatIndex)) {
-    metricLatIndex = COLLECTION_DEFAULTS.latMetricIndex;
-  }
-  if (!Number.isFinite(metricLngIndex)) {
-    metricLngIndex = COLLECTION_DEFAULTS.lngMetricIndex;
-  }
-  metricLatIndex = Math.max(
-    0,
-    Math.min(METRIC_MAX_INDEX, Math.floor(metricLatIndex))
-  );
-  metricLngIndex = Math.max(
-    0,
-    Math.min(METRIC_MAX_INDEX, Math.floor(metricLngIndex))
-  );
-  return { mode, metricLatIndex, metricLngIndex };
-}
-
-const SCALED_DETECTION_THRESHOLD = 10_000;
-
-function decodeMetricCentroid(cell, latIdx, lngIdx) {
-  if (!cell?.metrics || !Array.isArray(cell.metrics)) return null;
-  if (
-    latIdx < 0 ||
-    lngIdx < 0 ||
-    latIdx >= cell.metrics.length ||
-    lngIdx >= cell.metrics.length
-  ) {
-    return null;
-  }
-  const count = Number(cell.count);
-  if (!Number.isFinite(count) || count <= 0) return null;
-  const latSum = cell.metrics[latIdx];
-  const lngSum = cell.metrics[lngIdx];
-  if (!Number.isFinite(latSum) || !Number.isFinite(lngSum)) return null;
-  const perItem = Math.abs(latSum) / count;
-  const scale = perItem > SCALED_DETECTION_THRESHOLD ? METRIC_SCALE : 1;
-  const lat = latSum / (scale * count) - LAT_OFFSET;
-  const lng = lngSum / (scale * count) - LNG_OFFSET;
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-  return { lat, lng };
-}
-
-function ensureMetricCentroid(cell, latIdx, lngIdx) {
-  if (cell.__lat !== undefined) return true;
-  const decoded = decodeMetricCentroid(cell, latIdx, lngIdx);
-  if (!decoded) return false;
-  cell.__lat = decoded.lat;
-  cell.__lng = decoded.lng;
-  return true;
-}
 
 // ----------------------------------------------------------------------------
 // Worker constants
@@ -246,7 +162,7 @@ const MAX_VIRTUAL_CELLS_PER_SLOT = 20000;
 const MAX_VIRTUAL_ITEMS_PER_CELL = 50000;
 
 // Monitoring callback the Grid SDK can call.
-const NOOP_MONITORING = { send: () => {} };
+const NOOP_MONITORING = { enabled: false, send: () => {} };
 
 /**
  * Session seed that decides which node the SDK sticks to for reads.
@@ -263,14 +179,23 @@ function readRoutingKey(net) {
 }
 
 const packedPool = createBufferPool(BYTES_PER_INSTANCE);
+const deserializedBoundsCache = new WeakMap();
 
 // Reconstruct SDK Segment objects from the JSON-friendly bounds shape main
 // posts over postMessage. The SDK strips prototype methods through
 // structuredClone, so we always recreate them via the worker-local Space.
 function deserializeBounds(serializedBounds, space) {
-  return serializedBounds.map(({ dimension, segment }) =>
+  if (serializedBounds && typeof serializedBounds === "object") {
+    const cached = deserializedBoundsCache.get(serializedBounds);
+    if (cached?.space === space) return cached.bounds;
+  }
+  const bounds = serializedBounds.map(({ dimension, segment }) =>
     space.dimension(dimension).newSegment(segment)
   );
+  if (serializedBounds && typeof serializedBounds === "object") {
+    deserializedBoundsCache.set(serializedBounds, { space, bounds });
+  }
+  return bounds;
 }
 
 // ----------------------------------------------------------------------------
@@ -399,7 +324,7 @@ let pendingActivity = [];
 let activityTimer = null;
 const pendingIngest = new Map();
 let ingestCellsPerTick = INGEST_INITIAL_CELLS_PER_TICK;
-let perfDebugEnabled = true;
+let perfDebugEnabled = false;
 let perfSpikeThresholdMs = PERF_SPIKE_THRESHOLD_MS;
 let perfSnapshotMs = PERF_SNAPSHOT_MS;
 let perfSnapshotTimer = null;
@@ -1252,8 +1177,11 @@ function flushAndPack() {
   //
   // • Pure viewport/LOD geometry updates: swap packs immediately; only real
   //   `dataVersion` changes trigger prev/cur snapshot cross-fade.
-  const dataDrivenChange =
-    displayChanged && incomingDataVersion > lastTransitionDataVersion;
+  const dataDrivenChange = shouldArmDataDrivenTransition({
+    displayChanged,
+    incomingDataVersion,
+    lastTransitionDataVersion,
+  });
   let dataDrivenForEmit = false;
 
   if (transitionActive && previousDisplay) {
@@ -1692,21 +1620,35 @@ function metricSumsEqual(a, b) {
   return true;
 }
 
-function aggregateViewportMetricSums(zoom, metricCountHint = 0) {
+/**
+ * Retrieve the viewport item cells once for all pack-time consumers.
+ * Point-overlay admission and viewport metrics use the same depth/bounds.
+ */
+function retrieveViewportItems(zoom) {
+  if (!cube || !cubeSpace || zoom == null) return null;
+  const serialized = lastStrictBoundsSerialized || lastBoundsSerialized;
+  if (!serialized) return null;
+  const bounds = deserializeBounds(serialized, cubeSpace);
+  const viewport = bounds?.[0]?.value?.();
+  if (!Array.isArray(viewport) || viewport.length < 4) return null;
+  return {
+    viewport,
+    raw: cube.retrieve(liveDepth(zoom), bounds, cube.root, false, "items") || [],
+  };
+}
+
+function aggregateViewportMetricSums(
+  zoom,
+  metricCountHint = 0,
+  viewportItems = null
+) {
   const empty = {
     totalCount: 0,
     metricSums: Array.from({ length: Math.max(0, metricCountHint) }, () => 0),
   };
-  if (!cube || !cubeSpace || zoom == null) return empty;
-  const strictBoundsSerialized = lastStrictBoundsSerialized || lastBoundsSerialized;
-  if (!strictBoundsSerialized) return empty;
-
-  const strictBounds = deserializeBounds(strictBoundsSerialized, cubeSpace);
-  const viewport = strictBounds?.[0]?.value?.();
-  if (!Array.isArray(viewport) || viewport.length < 4) return empty;
-
-  const depth = liveDepth(zoom);
-  const raw = cube.retrieve(depth, strictBounds, cube.root, false, "items");
+  const source = viewportItems || retrieveViewportItems(zoom);
+  if (!source) return empty;
+  const { viewport, raw } = source;
   if (!raw || raw.length === 0) return empty;
 
   let totalCount = 0;
@@ -1809,7 +1751,7 @@ function scheduleViewportMetricsRefresh(zoom) {
 }
 
 /** Recompute viewport item totals synchronously (used at pack time). */
-function refreshViewportMetricsSync(zoom) {
+function refreshViewportMetricsSync(zoom, viewportItems = null) {
   if (zoom == null) {
     return {
       key: "",
@@ -1818,7 +1760,11 @@ function refreshViewportMetricsSync(zoom) {
       viewportDvf: viewportDvfFromMetricSums(0, []),
     };
   }
-  const aggregated = aggregateViewportMetricSums(zoom, lastKnownMetricCount);
+  const aggregated = aggregateViewportMetricSums(
+    zoom,
+    lastKnownMetricCount,
+    viewportItems
+  );
   const viewportDvf = viewportDvfFromMetricSums(
     aggregated.totalCount,
     aggregated.metricSums
@@ -1849,10 +1795,11 @@ function packAndEmit(dataDriven) {
     if (len > metricCount) metricCount = len;
   }
   lastKnownMetricCount = metricCount;
-  const pointOverlay = safeCollectPointOverlay(lastZoom);
+  const viewportItems = retrieveViewportItems(lastZoom);
+  const pointOverlay = safeCollectPointOverlay(lastZoom, viewportItems);
   // Sync totals so PACKED / UI badge reflect cube Abelian after reconcile
   // (debounced refresh alone skipped when zoom/bounds key was unchanged).
-  const metricsNow = refreshViewportMetricsSync(lastZoom);
+  const metricsNow = refreshViewportMetricsSync(lastZoom, viewportItems);
   const viewportMetricCount = metricsNow.totalCount;
   const viewportMetricSums = metricsNow.metricSums;
   const viewportDvf = metricsNow.viewportDvf;
@@ -1986,9 +1933,9 @@ function computeItemMetricValue(item) {
   return sum / denom;
 }
 
-function safeCollectPointOverlay(zoom) {
+function safeCollectPointOverlay(zoom, viewportItems = null) {
   try {
-    return collectPointOverlay(zoom);
+    return collectPointOverlay(zoom, viewportItems);
   } catch (error) {
     // Never let the optional points overlay break the heatmap pipeline.
     // Drop the overlay for this frame and surface the error for triage.
@@ -2024,7 +1971,7 @@ function safeCollectPointOverlay(zoom) {
 //         (same locations when dezoom merges coarse cells vs fine hashes).
 //      e. If item lists exist but none decode in viewport, scatter ONLY the
 //         remainder toward the parent's reported count budget.
-function collectPointOverlay(zoom) {
+function collectPointOverlay(zoom, viewportItems = null) {
   const threshold = pointOverlayConfig.maxPoints;
   const empty = {
     showPoints: false,
@@ -2034,17 +1981,9 @@ function collectPointOverlay(zoom) {
     threshold,
   };
 
-  if (!cube || !cubeSpace || zoom == null) return empty;
-  const strictBoundsSerialized =
-    lastStrictBoundsSerialized || lastBoundsSerialized;
-  if (!strictBoundsSerialized) return empty;
-
-  const strictBounds = deserializeBounds(strictBoundsSerialized, cubeSpace);
-  const viewport = strictBounds?.[0]?.value?.();
-  if (!Array.isArray(viewport) || viewport.length < 4) return empty;
-
-  const depth = liveDepth(zoom);
-  const raw = cube.retrieve(depth, strictBounds, cube.root, false, "items");
+  const source = viewportItems || retrieveViewportItems(zoom);
+  if (!source) return empty;
+  const { viewport, raw } = source;
   if (!raw || raw.length === 0) return empty;
 
   const visibleCells = [];
@@ -2812,7 +2751,7 @@ async function handleInit(payload) {
       perfSnapshotMs = PERF_SNAPSHOT_MS;
     }
   } else {
-    perfDebugEnabled = true;
+    perfDebugEnabled = false;
     perfSpikeThresholdMs = PERF_SPIKE_THRESHOLD_MS;
     perfSnapshotMs = PERF_SNAPSHOT_MS;
   }
@@ -2845,9 +2784,10 @@ async function handleInit(payload) {
     payload.gridOpt?.stream?.progressive === true;
 
   function gridStreamOutput(elements) {
-    stream.enqueue(elements);
     if (progressiveGridStream) {
-      stream.flushNow();
+      applyStreamBatch(elements);
+    } else {
+      stream.enqueue(elements);
     }
   }
 

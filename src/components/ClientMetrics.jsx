@@ -30,6 +30,18 @@ function age(ts) {
   return `${Math.floor(s / 60)}m ${s % 60}s ago`;
 }
 
+function shallowEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (a[key] !== b[key]) return false;
+  }
+  return true;
+}
+
 function Row({ label, value, hint }) {
   return (
     <div className="client-metrics-row" title={hint}>
@@ -65,7 +77,11 @@ export default function ClientMetrics({
   useEffect(() => {
     if (!controller?.subscribeNetwork) return undefined;
     return controller.subscribeNetwork((next) => {
-      if (next?.metrics) setSnap(next.metrics);
+      if (next?.metrics) {
+        setSnap((previous) =>
+          shallowEqual(previous, next.metrics) ? previous : next.metrics,
+        );
+      }
     });
   }, [controller]);
 
