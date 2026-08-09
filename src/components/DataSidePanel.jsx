@@ -3,7 +3,7 @@ import { formatDistanceKm } from "../lib/sdk.js";
 import { useOverlayScroll } from "../lib/overlayScroll.js";
 
 /**
- * Right-hand Data panel: same container switches Contrôles ↔ Items
+ * Right-hand Data panel: Contrôles ↔ Items ↔ Nodes
  * for both Nearby and Aggregate.
  */
 export default function DataSidePanel({
@@ -11,12 +11,16 @@ export default function DataSidePanel({
   onView,
   controls,
   items,
+  nodes = null,
   itemCount = 0,
+  nodeCount = 0,
   onAddClick,
   controlsLabel = "Contrôles",
   itemsLabel = "Items",
+  nodesLabel = "Nodes",
 }) {
   const bodyRef = useOverlayScroll([view]);
+  const showNodes = nodes != null;
 
   return (
     <aside className="data-side" aria-label="data side panel">
@@ -43,6 +47,20 @@ export default function DataSidePanel({
               <span className="data-side-count">{itemCount}</span>
             ) : null}
           </button>
+          {showNodes ? (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === "nodes"}
+              className={view === "nodes" ? "active" : ""}
+              onClick={() => onView("nodes")}
+            >
+              {nodesLabel}
+              {nodeCount > 0 ? (
+                <span className="data-side-count">{nodeCount}</span>
+              ) : null}
+            </button>
+          ) : null}
         </div>
         {onAddClick ? (
           <button
@@ -57,7 +75,11 @@ export default function DataSidePanel({
         ) : null}
       </div>
       <div className="data-side-body scroll-fade" ref={bodyRef}>
-        {view === "controls" ? controls : items}
+        {view === "controls"
+          ? controls
+          : view === "nodes" && showNodes
+            ? nodes
+            : items}
       </div>
     </aside>
   );

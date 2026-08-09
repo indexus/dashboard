@@ -8,6 +8,7 @@
     "build": "vite build",
     "start": "NODE_ENV=production node server.js",
     "preview": "vite preview",
+    "test": "node --test src/himo/js-indexus-sdk/**/*.test.mjs",
     "load-dvf": "node scripts/load_dvf.js --year 2020",
     "load-dvf:sample": "node scripts/load_dvf.js --year 2020 --limit 5000",
     "load-dvf:2020": "node scripts/load_dvf.js --year 2020",

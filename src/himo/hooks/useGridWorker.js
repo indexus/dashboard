@@ -8,12 +8,14 @@
 // Communication
 // -------------
 //   main → worker:  INIT, LOAD_POLYGON, MOVE, RELEASE_PACKED, TRANSITION_COMPLETE,
-//                    SET_CELL_POSITION, SET_POINT_OVERLAY_MAX_POINTS,
+//                    RECONCILE, SET_CELL_POSITION, SET_POINT_OVERLAY_MAX_POINTS,
 //                    SET_CUBE_SUBDIVISION_LIMIT, SET_REQUIRE_COMPLETE_CHILDREN,
 //                    SET_ALGO_RESOLUTION, SET_POLYGON_FILTER_ENABLED,
 //                    SET_VALUE_METRIC_INDEX, SET_CHILD_VIRTUALIZATION
 //   INIT.payload.debugHeatmap — optional console diagnostics ([heatmap-worker], …).
-//   worker → main:  INIT_COMPLETE, PACKED, VIEWPORT_METRICS, PERF_DEBUG, ERROR
+//   INIT.payload.debugSdk     — SDK read-path channels ([indexus:sets|refresh|cube]).
+//   worker → main:  INIT_COMPLETE, PACKED, VIEWPORT_METRICS, PERF_DEBUG,
+//                    NETWORK_PEERS, NETWORK_ACTIVITY, ERROR
 //
 // PACKED carries a Float32Array as a transferable, pooled inside the
 // worker — we send the buffer back via RELEASE_PACKED when a newer one
@@ -151,6 +153,8 @@ export function useGridWorker({
   const latestPackedRef = useRef(EMPTY_PACKED);
   const latestPointsRef = useRef(EMPTY_POINTS);
   const pointSubscribersRef = useRef(new Set());
+  const networkSubscribersRef = useRef(new Set());
+  const latestNetworkRef = useRef({ peers: [], activity: null });
   // Timestamp (Date.now()) until which we'll keep showing the previous
   // packed snapshot if the worker reports `instanceCount: 0`. Reset to
   // `now + EMPTY_PACK_GRACE_MS` every time a non-empty pack arrives, so
@@ -229,6 +233,7 @@ export function useGridWorker({
       { type: "module" }
     );
     workerRef.current = worker;
+    latestNetworkRef.current = { peers: [], activity: null };
 
     // Gate the first paint until coarse parent sets have had time to
     // subdivide toward the configured resolution / zone threshold.
@@ -252,6 +257,8 @@ export function useGridWorker({
         latestPackedRef,
         latestPointsRef,
         pointSubscribersRef,
+        networkSubscribersRef,
+        latestNetworkRef,
         emptyPackGraceUntilRef,
         revealAtRef,
         normalizerRef,
@@ -277,6 +284,9 @@ export function useGridWorker({
         network,
         bearer: bearer || undefined,
         debugPerf: gridOpt?.debugPerf,
+        // SDK read-path channels ("sets,refresh,cube", true, or false). The
+        // worker is a separate realm, so the console global does not reach it.
+        debugSdk: gridOpt?.debugSdk ?? globalThis.__INDEXUS_DEBUG__ ?? false,
         cellPosition: normalizeCellPositionConfig(
           cellPositionProp ?? DEFAULT_CELL_POSITION
         ),
@@ -447,6 +457,13 @@ export function useGridWorker({
     handler(gatedPointOverlay(latestPointsRef.current, revealAtRef));
     return () => subscribers.delete(handler);
   }, []);
+  const subscribeNetwork = useCallback((handler) => {
+    if (typeof handler !== "function") return NOOP;
+    const subscribers = networkSubscribersRef.current;
+    subscribers.add(handler);
+    handler(latestNetworkRef.current);
+    return () => subscribers.delete(handler);
+  }, []);
   const setCellPosition = useCallback((next) => {
     const normalized = normalizeCellPositionConfig(next);
     workerRef.current?.postMessage({
@@ -496,7 +513,6 @@ export function useGridWorker({
       payload: { value: value !== false },
     });
   }, []);
-
   // Stable controller object the WebGPU layer reads every frame.
   const controller = useMemo(
     () => ({
@@ -510,6 +526,7 @@ export function useGridWorker({
       getHeatmapOpacity,
       getPointOverlay,
       subscribePointOverlay,
+      subscribeNetwork,
       setCellPosition,
       setPointOverlayMaxPoints,
       setCubeSubdivisionLimit,
@@ -532,6 +549,7 @@ export function useGridWorker({
       getHeatmapOpacity,
       getPointOverlay,
       subscribePointOverlay,
+      subscribeNetwork,
       setCellPosition,
       setPointOverlayMaxPoints,
       setCubeSubdivisionLimit,
@@ -770,6 +788,40 @@ function handleWorkerMessage(event, ctx) {
       // Worker-side perf telemetry to diagnose CPU spikes.
       console.debug("[grid.worker][perf]", payload);
       break;
+
+    case "NETWORK_PEERS": {
+      const peers = Array.isArray(payload?.peers) ? payload.peers : [];
+      ctx.latestNetworkRef.current = {
+        ...ctx.latestNetworkRef.current,
+        peers,
+        routingKey:
+          payload?.routingKey ?? ctx.latestNetworkRef.current?.routingKey ?? null,
+      };
+      for (const sub of ctx.networkSubscribersRef.current) {
+        try {
+          sub(ctx.latestNetworkRef.current);
+        } catch {
+          /* ignore */
+        }
+      }
+      break;
+    }
+
+    case "NETWORK_ACTIVITY": {
+      ctx.latestNetworkRef.current = {
+        ...ctx.latestNetworkRef.current,
+        activity: payload || null,
+        activityAt: performance.now(),
+      };
+      for (const sub of ctx.networkSubscribersRef.current) {
+        try {
+          sub(ctx.latestNetworkRef.current);
+        } catch {
+          /* ignore */
+        }
+      }
+      break;
+    }
 
     case "ERROR":
       console.error("Worker error:", payload);

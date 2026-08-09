@@ -315,10 +315,17 @@ export function MeshConfigEditor({
         </SliderRow>
         <CheckRow
           label="snapshot handoff"
-          tip="Enable S3 / DirStore snapshot handoff protocol (INDEXUS_DELEGATION_S3)."
-          checked={draft.delegation_s3}
+          tip="Enable S3 / DirStore snapshot handoff protocol (INDEXUS_DELEGATION_S3). Forced off when in-memory lab is on."
+          checked={draft.in_memory ? false : draft.delegation_s3}
           onChange={(v) => set("delegation_s3", v)}
           dirty={isDirty("delegation_s3")}
+        />
+        <CheckRow
+          label="in-memory lab"
+          tip="INDEXUS_IN_MEMORY: empty -storage (RAM only), no object store, classic /transfer. Use for experiments where disk snapshots must not skew listed item counts."
+          checked={draft.in_memory}
+          onChange={(v) => set("in_memory", v)}
+          dirty={isDirty("in_memory")}
         />
         <DurationSlider
           label="handoff timeout"
@@ -480,13 +487,15 @@ export function MeshConfigEditor({
         </SliderRow>
         <SliderRow
           label="disk min free %"
-          tip="Minimum free disk %; below this the node signals pressure / may refuse work."
-          valueLabel={formatPct(draft.disk_min_free_pct)}
+          tip="Minimum free disk %; below this the node asks for scale-up. 0 disables the disk signal (lab)."
+          valueLabel={
+            draft.disk_min_free_pct <= 0 ? "off" : formatPct(draft.disk_min_free_pct)
+          }
           dirty={isDirty("disk_min_free_pct")}
         >
           <input
             type="range"
-            min={5}
+            min={0}
             max={80}
             step={1}
             value={draft.disk_min_free_pct}
@@ -604,7 +613,7 @@ export function MeshConfigEditor({
       >
         <CheckRow
           label="keep snapshots"
-          tip="Preserve .data-local/snapshots across remesh (node data under nodes/ is still wiped)."
+          tip="If unchecked (default), remesh deletes .data-local/snapshots (zones/, nodes/). Node data under nodes/ is always wiped."
           checked={keepSnapshots}
           onChange={onKeepSnapshots}
         />

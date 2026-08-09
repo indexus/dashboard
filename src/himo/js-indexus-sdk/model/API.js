@@ -26,24 +26,28 @@ class API {
   async addItem(protocol, peer, collection, location, metrics, reference) {}
 
   /**
-   * Retrieves a set of items from a collection at a specific location on a peer.
-   * @param {string} protocol - Protocol to use to contact the peer http/https.
-   * @param {Peer} peer - The peer from which to retrieve the set.
-   * @param {string} collection - The name of the collection.
-   * @param {string} location - The location identifier within the collection.
-   * @returns {Promise<Element[]>} - A promise that resolves with the retrieved set of items.
+   * Compatibility alias over getSets([location]).
+   * @param {string} protocol
+   * @param {Peer} peer
+   * @param {string} collection
+   * @param {string} location
+   * @param {boolean} [deep]
+   * @returns {Promise<{ contact: Peer, set: Element[] | null }>}
    */
-  async getSet(protocol, peer, collection, location) {}
+  async getSet(protocol, peer, collection, location, deep) {}
 
   /**
-   * Batch GET `/sets` (binary); decoded rows span all requested parents — split client-side if needed.
+   * Batch GET `/sets` (binary). Opt-in `envelope` carries IXS1 owner redirects.
+   * When `options.routingKey` is set the peer may answer with a closer read
+   * ingress, returned as `ingress`.
    * @param {string} protocol
    * @param {Peer} peer
    * @param {string} collection
    * @param {string[]} locations
-   * @returns {Promise<{ elements: Array }>}
+   * @param {{ propertyCount?: number, deep?: boolean, refresh?: boolean, envelope?: boolean, via?: string|string[], routingKey?: Uint8Array }} [options]
+   * @returns {Promise<{ elements: Array, redirects: Array, ingress?: { name: string, ip: string, port: number } | null }>}
    */
-  async getSets(protocol, peer, collection, locations) {}
+  async getSets(protocol, peer, collection, locations, options) {}
 }
 
 export { API };

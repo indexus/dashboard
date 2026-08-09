@@ -4,7 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-/** Vendored himo.place WebGPU heatmap (src/himo) — Aggregate source of truth. */
+/**
+ * Vendored himo.place WebGPU heatmap (src/himo). It also carries the SDK both
+ * read modes go through: Aggregate via Grid/Cube, Nearby via Local.
+ */
 const himoSrc = path.join(__dirname, "src/himo");
 const nm = path.join(__dirname, "node_modules");
 
@@ -26,7 +29,7 @@ export default defineConfig({
     "process.env.REACT_APP_INDEXUS_PEERS": "undefined",
   },
   optimizeDeps: {
-    include: ["buffer", "js-indexus-sdk", "axios", "maplibre-gl", "d3", "earcut"],
+    include: ["buffer", "axios", "maplibre-gl", "d3", "earcut"],
   },
   worker: {
     format: "es",
@@ -38,10 +41,25 @@ export default defineConfig({
       "/api": {
         target: "http://127.0.0.1:3847",
         changeOrigin: true,
+        timeout: 10_000,
+        configure: (proxy) => {
+          proxy.on("error", (err, _req, res) => {
+            console.warn("[vite] /api proxy:", err.code || err.message);
+            if (res && !res.headersSent) {
+              res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  error: "dashboard api unavailable (is server.js on :3847?)",
+                  detail: err.code || err.message,
+                })
+              );
+            }
+          });
+        },
       },
     },
     fs: {
-      allow: [__dirname, path.resolve(__dirname, "../sdk-js")],
+      allow: [__dirname],
     },
   },
   build: {

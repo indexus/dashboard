@@ -10,6 +10,10 @@ export default function Header({
   onCollection,
   mode,
   onMode,
+  readNavigation,
+  onReadNavigation,
+  readMethod,
+  onReadMethod,
   peerHint,
   onReset,
   busy,
@@ -61,6 +65,10 @@ export default function Header({
           onCollection={onCollection}
           mode={mode}
           onMode={onMode}
+          readNavigation={readNavigation}
+          onReadNavigation={onReadNavigation}
+          readMethod={readMethod}
+          onReadMethod={onReadMethod}
           peerHint={peerHint}
           onReset={onReset}
           busy={busy}
@@ -70,7 +78,7 @@ export default function Header({
       <div className="topbar-right">
         <div
           className={`topbar-status${error ? " err" : ""}`}
-          title={error || undefined}
+          title={typeof error === "string" && error ? error : undefined}
         >
           <span className={`live-dot${error ? " err" : ""}`}>
             <i />

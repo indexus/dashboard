@@ -19,7 +19,7 @@ export class SetsCoalescePool {
    * @param {{
    *   maxChunkSize?: number,
    *   maxParallelChunks?: number,
-   *   fetchChunk: (collection: string, locations: string[]) => Promise<void>,
+   *   fetchChunk: (collection: string, locations: string[], refresh: boolean) => Promise<void>,
    *   finalizeWaiter: (
    *     collection: string,
    *     waiter: { partialPrefix: Map<string, unknown>, uniqInput: string[] }
@@ -34,7 +34,8 @@ export class SetsCoalescePool {
         ? Math.floor(options.maxParallelChunks)
         : 16;
 
-    this.maxChunkSize = Math.max(4, maxChunk);
+    // Chunk size 1 is intentional for method=getSet (one-location batches).
+    this.maxChunkSize = Math.max(1, maxChunk);
     this.maxParallelChunks = Math.max(1, maxParallel);
     this.fetchChunk = options.fetchChunk;
     this.finalizeWaiter = options.finalizeWaiter;
@@ -56,15 +57,19 @@ export class SetsCoalescePool {
    * @param {Map<string, unknown>} partialPrefix locations already resolved (cache hits)
    * @param {string[]} uniqInput caller key order / membership
    * @param {string[]} missingArray locations still needing network (subset of uniqInput)
+   * @param {boolean} [refresh] one refreshing caller upgrades the whole wave:
+   *   the union is fetched once, and a fresher answer is never wrong for the
+   *   callers that did not ask for it.
    * @returns {Promise<Map<string, unknown>>}
    */
-  submit(collection, partialPrefix, uniqInput, missingArray) {
+  submit(collection, partialPrefix, uniqInput, missingArray, refresh = false) {
     return new Promise((resolve, reject) => {
       let slot = this._pending.get(collection);
       if (!slot) {
-        slot = { union: new NativeSet(), waiters: [] };
+        slot = { union: new NativeSet(), waiters: [], refresh: false };
         this._pending.set(collection, slot);
       }
+      if (refresh) slot.refresh = true;
       const missingList = Array.isArray(missingArray) ? missingArray : [];
       for (let i = 0; i < missingList.length; i++) {
         slot.union.add(missingList[i]);
@@ -116,7 +121,7 @@ export class SetsCoalescePool {
 
   /**
    * @param {string} collection
-   * @param {{ union: InstanceType<typeof NativeSet>, waiters: WaiterEntry[] }} bucket
+   * @param {{ union: InstanceType<typeof NativeSet>, waiters: WaiterEntry[], refresh?: boolean }} bucket
    */
   async _flushCollection(collection, bucket) {
     try {
@@ -128,7 +133,9 @@ export class SetsCoalescePool {
       for (let i = 0; i < chunks.length; i += this.maxParallelChunks) {
         const wave = chunks.slice(i, i + this.maxParallelChunks);
         await Promise.all(
-          wave.map((locations) => this.fetchChunk(collection, locations))
+          wave.map((locations) =>
+            this.fetchChunk(collection, locations, bucket.refresh === true)
+          )
         );
       }
 

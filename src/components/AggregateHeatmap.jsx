@@ -36,7 +36,11 @@ import {
   whitenBackdropRoadLabels,
 } from "@himo/components/mapStyle.js";
 
-import { GPS_DIM, DETAIL_LIMIT } from "../lib/sdk.js";
+import {
+  GPS_DIM,
+  DETAIL_LIMIT,
+  DEFAULT_READ_OPTIONS,
+} from "../lib/sdk.js";
 import {
   POINT_LAYER_ID,
   applyPointOverlay,
@@ -49,6 +53,7 @@ import DataSidePanel, {
   hitTitle,
   pointsToHits,
 } from "./DataSidePanel.jsx";
+import NodesList from "./NodesList.jsx";
 
 function popupHtmlFromHit(hit) {
   const title = hitTitle(hit);
@@ -235,6 +240,7 @@ function HimoHeatmapMap({
   onPolygonLoaded,
   onPointClick,
   onPointHover,
+  fullscreenContainerRef,
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -325,6 +331,13 @@ function HimoHeatmapMap({
       onRegisterRepaintRef.current?.(() => map.triggerRepaint());
       map.addControl(
         new maplibregl.NavigationControl({ showCompass: false }),
+        "top-right",
+      );
+      // Native MapLibre FS on the wrap (badge + legend + map), not a custom Full/Exit.
+      map.addControl(
+        new maplibregl.FullscreenControl({
+          container: fullscreenContainerRef?.current || undefined,
+        }),
         "top-right",
       );
 
@@ -483,8 +496,8 @@ export default function AggregateHeatmap({
   onAddClick,
   sideView = "controls",
   onSideView,
-  onRefresh,
-  refreshBusy = false,
+  onViewportChange,
+  readOptions = null,
 }) {
   const mapStyleMode = theme === "white" ? "white" : "dark";
   const [instances, setInstances] = useState(0);
@@ -492,9 +505,11 @@ export default function AggregateHeatmap({
   const [metricMode, setMetricMode] = useState("dvf");
   const [overlayMode, setOverlayMode] = useState("heatmap");
   const [visibleItemCount, setVisibleItemCount] = useState(0);
+  const [parentItemTotal, setParentItemTotal] = useState(0);
   const [pointCount, setPointCount] = useState(0);
   const [pointHits, setPointHits] = useState([]);
   const [selectedPoint, setSelectedPoint] = useState(null);
+  const [nodeCount, setNodeCount] = useState(0);
   const [normalizer, setNormalizerState] = useState(
     normalizerProp ?? DVF_NORMALIZER,
   );
@@ -524,6 +539,7 @@ export default function AggregateHeatmap({
   );
   const [polygonFilter, setPolygonFilter] = useState(false);
   const [visualPolygonFilter, setVisualPolygonFilter] = useState(true);
+  const mapWrapRef = useRef(null);
 
   const dynamicCenter = cellPosition.mode === CELL_POSITION_MODE_METRICS;
 
@@ -556,8 +572,20 @@ export default function AggregateHeatmap({
       peers: bearer ? peers : [],
       concurrency: 100,
       cacheSize: 50000,
+      setsPool: {
+        navigation: readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
+        method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
+        refreshTtlMs:
+          readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
+      },
     }),
-    [peers, bearer],
+    [
+      peers,
+      bearer,
+      readOptions?.navigation,
+      readOptions?.method,
+      readOptions?.refreshTtlMs,
+    ],
   );
 
   const cubeOpt = useMemo(
@@ -593,6 +621,30 @@ export default function AggregateHeatmap({
       valueMetricIndex: COLLECTION_DEFAULTS.valueMetricIndex,
       childVirtualizationEnabled: COLLECTION_DEFAULTS.childVirtualizationEnabled,
     });
+
+  const onViewportChangeRef = useRef(onViewportChange);
+  onViewportChangeRef.current = onViewportChange;
+  const handleMapMoveAndViewport = useCallback(
+    (nextZoom, bounds) => {
+      handleMapMove(nextZoom, bounds);
+      const cb = onViewportChangeRef.current;
+      if (!cb || nextZoom == null) return;
+      let lng;
+      let lat;
+      if (bounds && typeof bounds.getCenter === "function") {
+        const c = bounds.getCenter();
+        lng = c?.lng;
+        lat = c?.lat;
+      } else if (Array.isArray(bounds) && bounds.length >= 4) {
+        // [south, north, west, east]
+        lat = (Number(bounds[0]) + Number(bounds[1])) / 2;
+        lng = (Number(bounds[2]) + Number(bounds[3])) / 2;
+      }
+      if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
+      cb([lng, lat], nextZoom);
+    },
+    [handleMapMove],
+  );
 
   useEffect(() => {
     controller.setNormalizer?.(normalizer);
@@ -670,8 +722,22 @@ export default function AggregateHeatmap({
         next.avgSurfaceM2 > 0;
       setMetricMode(hasPurchase ? "dvf" : "density");
       setOverlayMode(stats.mode === "points" ? "points" : "heatmap");
-      setVisibleItemCount(
-        Number.isFinite(stats.visibleItemCount) ? stats.visibleItemCount : 0,
+      const fromMetrics = Number.isFinite(stats.metricTotalCount)
+        ? Math.round(stats.metricTotalCount)
+        : 0;
+      const fromOverlay = Number.isFinite(stats.visibleItemCount)
+        ? Math.round(stats.visibleItemCount)
+        : 0;
+      const fromDvf = Number.isFinite(stats.dvf?.transactions)
+        ? Math.round(stats.dvf.transactions)
+        : 0;
+      setVisibleItemCount(fromOverlay);
+      // Prefer viewport metric sum (visible parent zones); fall back to
+      // DVF transactions then the heatmap↔points weighted gate count.
+      const nextParentTotal =
+        fromMetrics > 0 ? fromMetrics : fromDvf > 0 ? fromDvf : fromOverlay;
+      setParentItemTotal((prev) =>
+        prev === nextParentTotal ? prev : nextParentTotal,
       );
       setPointCount(
         Number.isFinite(stats.renderedPointCount)
@@ -691,6 +757,14 @@ export default function AggregateHeatmap({
   }, [controller]);
 
   useEffect(() => {
+    const unsub = controller.subscribeNetwork?.((snap) => {
+      const n = Array.isArray(snap?.peers) ? snap.peers.length : 0;
+      setNodeCount((prev) => (prev === n ? prev : n));
+    });
+    return () => unsub?.();
+  }, [controller]);
+
+  useEffect(() => {
     onViewportStats?.({
       instances,
       metricMode,
@@ -699,6 +773,7 @@ export default function AggregateHeatmap({
       mapStyleMode,
       overlayMode,
       visibleItemCount,
+      parentItemTotal,
       pointCount,
     });
   }, [
@@ -709,22 +784,27 @@ export default function AggregateHeatmap({
     mapStyleMode,
     overlayMode,
     visibleItemCount,
+    parentItemTotal,
     pointCount,
     onViewportStats,
   ]);
 
   useEffect(() => {
+    const itemsLabel =
+      parentItemTotal > 0
+        ? `${parentItemTotal.toLocaleString("fr-FR")} items`
+        : "0 items";
     if (overlayMode === "points") {
       onStatus?.(
-        `points · ${pointCount} ventes · ${visibleItemCount} items ≤ ${maxPoints}`,
+        `points · ${pointCount} ventes · ${itemsLabel} ≤ ${maxPoints}`,
       );
     } else if (metricMode === "dvf" && dvf?.avgEuroM2 != null) {
       onStatus?.(
-        `DVF · ${formatEuroM2(dvf.avgEuroM2)} · ${dvf.transactions ?? 0} tx · ${instances} disks`,
+        `DVF · ${formatEuroM2(dvf.avgEuroM2)} · ${itemsLabel} · ${instances} disks`,
       );
     } else {
       onStatus?.(
-        `density · ${instances} disks · peers ${peers.length} · n=${normalizer}`,
+        `density · ${itemsLabel} · ${instances} disks · peers ${peers.length}`,
       );
     }
   }, [
@@ -737,6 +817,7 @@ export default function AggregateHeatmap({
     overlayMode,
     pointCount,
     visibleItemCount,
+    parentItemTotal,
     maxPoints,
   ]);
 
@@ -757,8 +838,16 @@ export default function AggregateHeatmap({
       transactions: dvf?.transactions,
       instances,
       visibleItemCount,
+      parentItemTotal,
     }),
-    [overlayMode, pointCount, dvf, instances, visibleItemCount],
+    [
+      overlayMode,
+      pointCount,
+      dvf,
+      instances,
+      visibleItemCount,
+      parentItemTotal,
+    ],
   );
 
   // Must stay above any early return — peers/bearer flip would otherwise
@@ -789,17 +878,6 @@ export default function AggregateHeatmap({
       <div className="agg-shell">
         <div className="map-wrap">
           <div className="map-mode-badge">aggregate · waiting</div>
-          {onRefresh ? (
-            <button
-              type="button"
-              className="map-refresh-btn"
-              disabled={refreshBusy}
-              onClick={onRefresh}
-              title="Refresh peers and remount Aggregate"
-            >
-              Refresh
-            </button>
-          ) : null}
           <div
             className="map-el"
             style={{
@@ -819,6 +897,7 @@ export default function AggregateHeatmap({
           onView={onSideView || (() => {})}
           onAddClick={onAddClick}
           itemCount={0}
+          nodeCount={0}
           controls={
             <div className="hit meta" style={{ color: "var(--fog)" }}>
               en attente du mesh…
@@ -829,44 +908,55 @@ export default function AggregateHeatmap({
               pas encore de points
             </div>
           }
+          nodes={
+            <div className="hit meta" style={{ color: "var(--fog)" }}>
+              en attente des peers…
+            </div>
+          }
         />
       </div>
     );
   }
 
+  const itemsBadge =
+    parentItemTotal > 0
+      ? parentItemTotal.toLocaleString("fr-FR")
+      : "0";
   const badge =
     overlayMode === "points"
-      ? `points · ${pointCount}`
+      ? `points · ${pointCount} · ${itemsBadge} items`
       : metricMode === "dvf" && dvf?.avgEuroM2 != null
-        ? `heatmap · ${formatEuroM2(dvf.avgEuroM2)}`
-        : `heatmap · ${mapStyleMode === "white" ? "light" : "dark"}`;
+        ? `heatmap · ${formatEuroM2(dvf.avgEuroM2)} · ${itemsBadge} items`
+        : `heatmap · ${itemsBadge} items`;
 
   const controls = (
-    <DataMapControls
-      resolution={resolution}
-      onResolution={setResolution}
-      maxPoints={maxPoints}
-      onMaxPoints={setMaxPoints}
-      zoneLimit={zoneLimit}
-      onZoneLimit={setZoneLimit}
-      multiplier={multiplier}
-      onMultiplier={setMultiplier}
-      areaMode={areaMode}
-      onAreaMode={setAreaMode}
-      dynamicCenter={dynamicCenter}
-      onDynamicCenter={onDynamicCenter}
-      requireCompleteChildren={requireCompleteChildren}
-      onRequireCompleteChildren={setRequireCompleteChildren}
-      childVirtualization={childVirtualization}
-      onChildVirtualization={setChildVirtualization}
-      normalizer={normalizer}
-      onNormalizer={setNormalizerState}
-      polygonFilter={polygonFilter}
-      onPolygonFilter={setPolygonFilter}
-      visualPolygonFilter={visualPolygonFilter}
-      onVisualPolygonFilter={setVisualPolygonFilter}
-      metrics={metrics}
-    />
+    <>
+      <DataMapControls
+        resolution={resolution}
+        onResolution={setResolution}
+        maxPoints={maxPoints}
+        onMaxPoints={setMaxPoints}
+        zoneLimit={zoneLimit}
+        onZoneLimit={setZoneLimit}
+        multiplier={multiplier}
+        onMultiplier={setMultiplier}
+        areaMode={areaMode}
+        onAreaMode={setAreaMode}
+        dynamicCenter={dynamicCenter}
+        onDynamicCenter={onDynamicCenter}
+        requireCompleteChildren={requireCompleteChildren}
+        onRequireCompleteChildren={setRequireCompleteChildren}
+        childVirtualization={childVirtualization}
+        onChildVirtualization={setChildVirtualization}
+        normalizer={normalizer}
+        onNormalizer={setNormalizerState}
+        polygonFilter={polygonFilter}
+        onPolygonFilter={setPolygonFilter}
+        visualPolygonFilter={visualPolygonFilter}
+        onVisualPolygonFilter={setVisualPolygonFilter}
+        metrics={metrics}
+      />
+    </>
   );
 
   const itemsPanel =
@@ -886,19 +976,10 @@ export default function AggregateHeatmap({
 
   return (
     <div className="agg-shell">
-      <div className={`map-wrap map-wrap--${mapStyleMode}`}>
-        <div className="map-mode-badge">{badge}</div>
-        {onRefresh ? (
-          <button
-            type="button"
-            className="map-refresh-btn"
-            disabled={refreshBusy}
-            onClick={onRefresh}
-            title="Refresh peers and remount Aggregate"
-          >
-            Refresh
-          </button>
-        ) : null}
+      <div ref={mapWrapRef} className={`map-wrap map-wrap--${mapStyleMode}`}>
+        <div className="map-mode-bar">
+          <div className="map-mode-badge">{badge}</div>
+        </div>
         <div
           className="heatmap-legend"
           title={`prix/m² · normalizer ${normalizer}`}
@@ -921,7 +1002,8 @@ export default function AggregateHeatmap({
           averageGridController={controller}
           mapStyleMode={mapStyleMode}
           visualPolygonFilter={visualPolygonFilter}
-          onMove={handleMapMove}
+          fullscreenContainerRef={mapWrapRef}
+          onMove={handleMapMoveAndViewport}
           onRegisterRepaint={registerRepaint}
           onPolygonLoaded={onPolygonLoaded}
           onPointClick={onPointSelect}
@@ -932,8 +1014,10 @@ export default function AggregateHeatmap({
         onView={onSideView || (() => {})}
         onAddClick={onAddClick}
         itemCount={overlayMode === "points" ? pointHits.length : 0}
+        nodeCount={nodeCount}
         controls={controls}
         items={itemsPanel}
+        nodes={<NodesList controller={controller} />}
       />
     </div>
   );

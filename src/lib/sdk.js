@@ -1,4 +1,10 @@
-import { Collection, Space, Local, API, Peer } from "js-indexus-sdk";
+import {
+  Collection,
+  Space,
+  Local,
+  API,
+  Network,
+} from "../himo/js-indexus-sdk/index.js";
 import { issueToken } from "./api.js";
 
 export const GPS_DIM = { name: "gps", type: "spherical", args: [-90, 90, -180, 180] };
@@ -30,131 +36,55 @@ export const VIEW_MODES = [
 /** metrics[2] — used by nearby summarizeItem (geo_load / DVF). */
 export const METRIC_VALUE_INDEX = 2;
 
+/** Default shared read configuration (Nearby + Aggregate). */
+export const DEFAULT_READ_OPTIONS = Object.freeze({
+  navigation: "direct",
+  method: "getSets",
+  /** Floor between two `refresh` reads of the same zone. */
+  refreshTtlMs: 5000,
+});
+
 /**
- * Multi-peer network for Local.search.
- * Pings every known mesh host, follows contacts on getSet (same pattern as geo_nearest.js).
- * Prefer this over SDK Network.discoverPeers which races before the table is warm.
+ * Zones the Nearby Network keeps. Local exploration walks far more than the
+ * old 1000 before the user moves, and every eviction is a `/sets` we already
+ * paid for.
  */
-class MeshNetwork {
-  constructor(protocol, api, hosts, concurrency = 32) {
-    this._protocol = protocol;
-    this._api = api;
-    this._concurrency = concurrency;
-    this._hosts = [...new Set((hosts || []).filter(Boolean))];
-    /** @type {import("js-indexus-sdk").Peer[]} */
-    this._peers = [];
-    this._ready = this._discover();
+const NEARBY_CACHE_SIZE = 20000;
+
+/**
+ * Nearby and Aggregate share one Network and one read configuration.
+ * Local only needs getSet, which the Network answers from the same `/sets`
+ * engine and cache Grid fills.
+ *
+ * @param {string[]} hosts - mesh bootstrap hosts, `ip|port`
+ * @param {{ navigation?: "ingress"|"direct", method?: "getSet"|"getSets" }} [readOptions]
+ */
+async function connect(hosts, readOptions = DEFAULT_READ_OPTIONS) {
+  const bootstraps = [...new Set((hosts || []).filter(Boolean))];
+  if (!bootstraps.length) {
+    throw new Error("no mesh hosts — wait for /api/mesh nodes");
   }
 
-  getConcurrency() {
-    return this._concurrency;
-  }
-
-  hosts() {
-    return this._hosts.slice();
-  }
-
-  peerCount() {
-    return this._peers.length;
-  }
-
-  async _discover() {
-    if (!this._hosts.length) {
-      throw new Error("no mesh hosts — wait for /api/mesh nodes");
-    }
-    const settled = await Promise.allSettled(
-      this._hosts.map(async (host) => {
-        const [ip, portStr] = host.split("|");
-        const port = parseInt(portStr, 10);
-        if (!ip || !Number.isFinite(port)) {
-          throw new Error(`bad host ${host}`);
-        }
-        return this._api.pingPeer(this._protocol, ip, port);
-      }),
+  const network = new Network(
+    "http",
+    new API(),
+    bootstraps,
+    50,
+    NEARBY_CACHE_SIZE,
+    {
+      navigation: readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
+      method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
+      refreshTtlMs:
+        readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
+    },
+  );
+  await network.whenReady();
+  if (!network.listPeers().length) {
+    throw new Error(
+      `failed to ping any peer (${bootstraps.length} hosts: ${bootstraps.join(", ")})`,
     );
-    const peers = [];
-    const seen = new Set();
-    for (const r of settled) {
-      if (r.status !== "fulfilled" || !r.value) continue;
-      const peer = r.value;
-      const key = peer.hash?.() || `${peer.ip?.()}:${peer.port?.()}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      peers.push(peer);
-    }
-    this._peers = peers;
-    if (!peers.length) {
-      throw new Error(
-        `failed to ping any peer (${this._hosts.length} hosts: ${this._hosts.join(", ")})`,
-      );
-    }
   }
-
-  _remember(peer) {
-    if (!(peer instanceof Peer)) return;
-    const key = peer.hash?.() || `${peer.ip?.()}:${peer.port?.()}`;
-    if (this._peers.some((p) => (p.hash?.() || "") === key)) return;
-    this._peers.push(peer);
-  }
-
-  _pickPeer(i = 0) {
-    if (!this._peers.length) return null;
-    return this._peers[i % this._peers.length];
-  }
-
-  async getSet(coll, location) {
-    await this._ready;
-    let peer = this._pickPeer(0);
-    if (!peer) return [];
-
-    for (let hop = 0; hop < 12; hop++) {
-      try {
-        const response = await this._api.getSet(this._protocol, peer, coll, location);
-        if (response.contact instanceof Peer) {
-          this._remember(response.contact);
-          if (
-            response.contact.hash() !== peer.hash() &&
-            response.set === null
-          ) {
-            peer = response.contact;
-            continue;
-          }
-        }
-        return response.set || [];
-      } catch (e) {
-        // Try next known peer; Grid.process assumes an array.
-        peer = this._pickPeer(hop + 1);
-        if (!peer) {
-          console.warn("getSet failed", coll, location, e.message || e);
-          return [];
-        }
-      }
-    }
-    return [];
-  }
-
-  async addItem(collection, root, location, metrics, reference) {
-    await this._ready;
-    let lastErr = null;
-    for (let i = 0; i < this._peers.length; i++) {
-      const peer = this._pickPeer(i);
-      try {
-        await this._api.addItem(
-          this._protocol,
-          peer,
-          collection,
-          root,
-          location,
-          metrics,
-          reference,
-        );
-        return;
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-    throw lastErr || new Error("addItem failed on all peers");
-  }
+  return network;
 }
 
 let tokenPromise = null;
@@ -297,14 +227,28 @@ export function summarizeItem(item, rank, origin = null) {
 
 export class SearchSession {
   /**
-   * @param {{ collectionName: string, hosts: string[], lat: number, lng: number, step: number }} opts
+   * @param {{
+   *   collectionName: string,
+   *   hosts: string[],
+   *   lat: number,
+   *   lng: number,
+   *   step: number,
+   *   readOptions?: { navigation?: "ingress"|"direct", method?: "getSet"|"getSets" },
+   * }} opts
    */
-  constructor({ collectionName, hosts, lat, lng, step }) {
+  constructor({ collectionName, hosts, lat, lng, step, readOptions }) {
     this.collectionName = collectionName;
     this.hosts = hosts;
     this.lat = lat;
     this.lng = lng;
     this.step = step;
+    this.readOptions = {
+      navigation:
+        readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
+      method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
+      refreshTtlMs:
+        readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
+    };
     this._batch = [];
     this._local = null;
     this._network = null;
@@ -316,9 +260,7 @@ export class SearchSession {
     this._ready = (async () => {
       await ensureToken();
       const { space, gps } = buildCollection(this.collectionName);
-      const api = new API();
-      this._network = new MeshNetwork("http", api, this.hosts);
-      await this._network._ready;
+      this._network = await connect(this.hosts, this.readOptions);
 
       const output = {
         send: (results) => {
@@ -340,8 +282,8 @@ export class SearchSession {
         this._network,
       );
       return {
-        peers: this._network.peerCount(),
-        hosts: this._network.hosts(),
+        peers: this._network.listPeers().length,
+        hosts: this.hosts,
       };
     })();
     return this._ready;
@@ -419,8 +361,14 @@ export async function addGeoItem({
       : [1, 0, 0, lat + 90, lng + 180];
   const reference = id || `dash-${Date.now().toString(36)}`;
 
-  const api = new API();
-  const network = new MeshNetwork("http", api, resolved);
+  const network = await connect(resolved);
   await network.addItem(collectionName, "@", location, metrics, reference);
-  return { id: reference, location, lat, lng, metrics, peers: network.peerCount() };
+  return {
+    id: reference,
+    location,
+    lat,
+    lng,
+    metrics,
+    peers: network.listPeers().length,
+  };
 }

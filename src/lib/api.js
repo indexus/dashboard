@@ -5,7 +5,15 @@ async function parse(res) {
 }
 
 export function getMesh() {
-  return fetch("/api/mesh").then(parse);
+  return fetch("/api/mesh")
+    .then(parse)
+    .catch((err) => {
+      const msg = err?.message || String(err);
+      if (/Failed to fetch|NetworkError|ERR_/i.test(msg)) {
+        throw new Error("dashboard api unavailable (proxy → :3847)");
+      }
+      throw err;
+    });
 }
 
 export function getHealth() {
@@ -81,6 +89,21 @@ export function loadDvf(body) {
 
 export function getDvfStatus() {
   return fetch("/api/dvf/status").then(parse);
+}
+
+/** Pause a running DVF load (inserts stop until resume). */
+export function pauseDvf() {
+  return fetch("/api/dvf/pause", { method: "POST" }).then(parse);
+}
+
+/** Resume a paused DVF load. */
+export function resumeDvf() {
+  return fetch("/api/dvf/resume", { method: "POST" }).then(parse);
+}
+
+/** Abort a running DVF load (cannot resume). */
+export function stopDvf() {
+  return fetch("/api/dvf/stop", { method: "POST" }).then(parse);
 }
 
 export function getMeshConfig() {

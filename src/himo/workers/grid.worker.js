@@ -76,6 +76,7 @@ import {
   createCubeRuntime,
   createGridRuntime,
 } from "../lib/indexus/runtime";
+import { setDebug } from "../js-indexus-sdk/index.js";
 import {
   BYTES_PER_INSTANCE,
   FLOATS_PER_INSTANCE,
@@ -193,6 +194,14 @@ const INGEST_MIN_CELLS_PER_TICK = 256;
 const INGEST_MAX_CELLS_PER_TICK = 12000;
 const INGEST_INITIAL_CELLS_PER_TICK = 2500;
 const MOVE_INTERACTION_SUPPRESS_MS = 120;
+/** Debounce after MOVE settle / finish before Abelian reconcile. */
+const RECONCILE_DEBOUNCE_MS = 1000;
+/**
+ * Quiet period after a reconcile/repair finishes before the next idle repair.
+ * Measured from completion (not from start), so a long repair never overlaps
+ * the next tick.
+ */
+const RECONCILE_IDLE_MS = 10000;
 const EMPTY_PACK_HOLD_MS = 1800;
 const PERF_SPIKE_THRESHOLD_MS = 22;
 const PERF_SNAPSHOT_MS = 2000;
@@ -209,6 +218,20 @@ const MAX_VIRTUAL_ITEMS_PER_CELL = 50000;
 
 // Monitoring callback the Grid SDK can call.
 const NOOP_MONITORING = { send: () => {} };
+
+/**
+ * Session seed that decides which node the SDK sticks to for reads.
+ * @param {{ routingKeyHash?: () => string }} net
+ * @returns {string|null}
+ */
+function readRoutingKey(net) {
+  if (typeof net?.routingKeyHash !== "function") return null;
+  try {
+    return net.routingKeyHash();
+  } catch {
+    return null;
+  }
+}
 
 const packedPool = createBufferPool(BYTES_PER_INSTANCE);
 
@@ -322,6 +345,13 @@ let ingestTimer = null;
 let emptyPackHoldTimer = null;
 let lastMoveAtMs = 0;
 let lastNonEmptyPackAtMs = 0;
+let reconcileDebounceTimer = null;
+let reconcileIdleTimer = null;
+let reconcileInFlight = false;
+/** Coalesce: at most one follow-up run after the in-flight reconcile. */
+let reconcilePendingForce = null;
+/** True while the repair pass is driving its own viewport re-drill. */
+let redrillInFlight = false;
 const pendingIngest = new Map();
 let ingestCellsPerTick = INGEST_INITIAL_CELLS_PER_TICK;
 let perfDebugEnabled = true;
@@ -625,6 +655,139 @@ function resetIngestQueue() {
     clearTimeout(emptyPackHoldTimer);
     emptyPackHoldTimer = null;
   }
+}
+
+function stopReconcileTimers() {
+  redrillInFlight = false;
+  if (reconcileDebounceTimer != null) {
+    clearTimeout(reconcileDebounceTimer);
+    reconcileDebounceTimer = null;
+  }
+  if (reconcileIdleTimer != null) {
+    clearTimeout(reconcileIdleTimer);
+    reconcileIdleTimer = null;
+  }
+}
+
+function scheduleReconcileDebounced() {
+  // A drill the repair itself started is not user movement: re-arming the
+  // short debounce here is what turned one repair into a permanent one.
+  if (redrillInFlight) {
+    scheduleReconcileIdle();
+    return;
+  }
+  // Debounced MOVE repair supersedes any pending idle tick.
+  if (reconcileIdleTimer != null) {
+    clearTimeout(reconcileIdleTimer);
+    reconcileIdleTimer = null;
+  }
+  if (reconcileDebounceTimer != null) clearTimeout(reconcileDebounceTimer);
+  reconcileDebounceTimer = setTimeout(() => {
+    reconcileDebounceTimer = null;
+    void runReconcile(false);
+  }, RECONCILE_DEBOUNCE_MS);
+}
+
+/** Arm the next idle repair for RECONCILE_IDLE_MS after now (post-completion). */
+function scheduleReconcileIdle() {
+  if (reconcileIdleTimer != null) {
+    clearTimeout(reconcileIdleTimer);
+    reconcileIdleTimer = null;
+  }
+  reconcileIdleTimer = setTimeout(() => {
+    reconcileIdleTimer = null;
+    void runReconcile(false);
+  }, RECONCILE_IDLE_MS);
+}
+
+/**
+ * @param {boolean} force — skip MOVE-debounce gate (RECONCILE message).
+ */
+async function runReconcile(force = false) {
+  if (!grid || !cube) return;
+  if (reconcileInFlight) {
+    // One refresh at a time — keep a single follow-up (prefer forced).
+    if (reconcilePendingForce === null || force) {
+      reconcilePendingForce = force;
+    }
+    return;
+  }
+  if (!force && nowMs() - lastMoveAtMs < RECONCILE_DEBOUNCE_MS) {
+    // Camera still settling — retry after the idle gap from now.
+    scheduleReconcileIdle();
+    return;
+  }
+  if (lastZoom == null || !lastBoundsSerialized) {
+    scheduleReconcileIdle();
+    return;
+  }
+
+  // This run owns the idle schedule; re-arm only after it finishes.
+  if (reconcileIdleTimer != null) {
+    clearTimeout(reconcileIdleTimer);
+    reconcileIdleTimer = null;
+  }
+
+  reconcileInFlight = true;
+  reconcilePendingForce = null;
+  try {
+    const bounds = deserializeBounds(lastBoundsSerialized, grid.space);
+    const result = await grid.reconcileVisible(lastZoom, bounds, cube);
+    if (result?.dirty > 0) {
+      dataVersion += 1;
+      // The re-drill re-reads the whole viewport, and its `finish` arms another
+      // repair. Branches replaced without moving the visible total are the
+      // pruned deep tiers the display band drops anyway, so re-drilling them
+      // only feeds the next pass the same work.
+      if (result.rootAfter !== result.rootBefore) {
+        // replaceBranch may have swapped a shallow shadow — force a full
+        // viewport drill so the cube re-descends to zoom+resolution.
+        redrillInFlight = true;
+        try {
+          await grid.move(lastZoom, bounds, { force: true });
+        } catch (moveErr) {
+          console.warn(
+            "[aggregate.refresh] post-reconcile redrill failed:",
+            moveErr
+          );
+        } finally {
+          redrillInFlight = false;
+        }
+      }
+    }
+    // Drop cells finer than the Aggregate display band (z-1..z+1).
+    const pruned = pruneCubePastViewportLod();
+    if (result?.dirty > 0 || pruned > 0) {
+      // Force metrics recompute on next pack even if camera key is unchanged.
+      viewportMetricsState = {
+        key: "",
+        totalCount: 0,
+        metricSums: [],
+        viewportDvf: viewportDvfFromMetricSums(0, []),
+      };
+      requestImmediateFlush();
+    }
+  } catch (error) {
+    console.warn("[aggregate.refresh] reconcile failed:", error);
+  } finally {
+    reconcileInFlight = false;
+    const pending = reconcilePendingForce;
+    reconcilePendingForce = null;
+    if (pending !== null) {
+      // Follow-up runs now; it will arm idle when *it* finishes.
+      void runReconcile(pending);
+    } else {
+      // 10s quiet after this repair completed (even if it ran long).
+      scheduleReconcileIdle();
+    }
+  }
+}
+
+/** Keep at most display tiers z-1..z+1 (z = floor(zoom + algoRes)). */
+function pruneCubePastViewportLod() {
+  if (!cube || lastZoom == null) return 0;
+  const z = Math.floor(lastZoom + algorithmResolution);
+  return cube.pruneDeeperThan(z + 1);
 }
 
 // ----------------------------------------------------------------------------
@@ -1250,8 +1413,6 @@ function aggregateViewportMetricSums(zoom, metricCountHint = 0) {
   for (let i = 0; i < raw.length; i++) {
     const element = raw[i];
     if (!element || !(element.count > 0)) continue;
-    const m = element.metrics;
-    if (!Array.isArray(m) || m.length === 0) continue;
 
     const cellRect = readCellRect(element);
     let fraction = 1;
@@ -1263,6 +1424,12 @@ function aggregateViewportMetricSums(zoom, metricCountHint = 0) {
       if (!pointInViewport(element.__lat, element.__lng, viewport)) continue;
     }
 
+    // Always accumulate item mass from visible parent zones, even when
+    // purchase metrics are missing (density / incomplete Abelian).
+    totalCount += element.count * fraction;
+
+    const m = element.metrics;
+    if (!Array.isArray(m) || m.length === 0) continue;
     if (m.length > metricSums.length) {
       const prevLen = metricSums.length;
       metricSums.length = m.length;
@@ -1272,7 +1439,6 @@ function aggregateViewportMetricSums(zoom, metricCountHint = 0) {
       const value = m[j];
       if (Number.isFinite(value)) metricSums[j] += value * fraction;
     }
-    totalCount += element.count * fraction;
   }
 
   if (!(totalCount > 0)) return empty;
@@ -1330,13 +1496,39 @@ function flushViewportMetricsRefresh() {
 function scheduleViewportMetricsRefresh(zoom) {
   if (zoom == null) return;
   const key = viewportMetricsKey(zoom);
-  if (key && key === viewportMetricsState.key) return;
+  // Always re-queue after pack/reconcile — Abelian counts can change without
+  // a zoom/bounds key change, so do not early-return on key equality here.
   pendingViewportMetrics = { zoom, key };
   if (viewportMetricsTimer !== null) return;
   viewportMetricsTimer = setTimeout(
     flushViewportMetricsRefresh,
     VIEWPORT_METRICS_DEBOUNCE_MS
   );
+}
+
+/** Recompute viewport item totals synchronously (used at pack time). */
+function refreshViewportMetricsSync(zoom) {
+  if (zoom == null) {
+    return {
+      key: "",
+      totalCount: 0,
+      metricSums: [],
+      viewportDvf: viewportDvfFromMetricSums(0, []),
+    };
+  }
+  const aggregated = aggregateViewportMetricSums(zoom, lastKnownMetricCount);
+  const viewportDvf = viewportDvfFromMetricSums(
+    aggregated.totalCount,
+    aggregated.metricSums
+  );
+  const key = viewportMetricsKey(zoom);
+  viewportMetricsState = {
+    key,
+    totalCount: aggregated.totalCount,
+    metricSums: aggregated.metricSums,
+    viewportDvf,
+  };
+  return viewportMetricsState;
 }
 
 // ----------------------------------------------------------------------------
@@ -1356,9 +1548,13 @@ function packAndEmit(dataDriven) {
   }
   lastKnownMetricCount = metricCount;
   const pointOverlay = safeCollectPointOverlay(lastZoom);
-  const viewportMetricCount = viewportMetricsState.totalCount;
-  const viewportMetricSums = viewportMetricsState.metricSums;
-  const viewportDvf = viewportMetricsState.viewportDvf;
+  // Sync totals so PACKED / UI badge reflect cube Abelian after reconcile
+  // (debounced refresh alone skipped when zoom/bounds key was unchanged).
+  const metricsNow = refreshViewportMetricsSync(lastZoom);
+  const viewportMetricCount = metricsNow.totalCount;
+  const viewportMetricSums = metricsNow.metricSums;
+  const viewportDvf = metricsNow.viewportDvf;
+  // Keep debounced path for MOVE settle / late ingest.
   scheduleViewportMetricsRefresh(lastZoom);
 
   if (n === 0) {
@@ -2215,6 +2411,7 @@ self.onmessage = async (event) => {
           if (grid && lastZoom != null && lastBoundsSerialized) {
             grid.move(lastZoom, deserializeBounds(lastBoundsSerialized, grid.space));
           }
+          pruneCubePastViewportLod();
           requestImmediateFlush();
         }
         break;
@@ -2269,7 +2466,14 @@ async function handleInit(payload) {
     globalThis.__INDEXUS_BEARER__ = payload.bearer;
   }
 
+  // The whole read path runs in here, so the SDK channels are worthless unless
+  // the flag crosses with INIT — the main thread's global is a different realm.
+  if (payload.debugSdk !== undefined) {
+    setDebug(payload.debugSdk);
+  }
+
   resetIngestQueue();
+  stopReconcileTimers();
   stopPerfSnapshot();
   heatmapDebugEnabled = payload.debugHeatmap === true;
   lastHeatmapEmptyEmitLogMs = 0;
@@ -2331,20 +2535,50 @@ async function handleInit(payload) {
     payload.gridOpt,
     gridStreamOutput,
     // `finish` callback: flush stream chunks immediately but keep ingest
-    // non-blocking to avoid stalling interaction frames.
+    // non-blocking to avoid stalling interaction frames. Also schedule a
+    // debounced Abelian reconcile once the MOVE drill settles.
     () => {
       stream.flushNow();
       scheduleIngest();
+      scheduleReconcileDebounced();
     },
     NOOP_MONITORING,
     payload.network
   );
   grid = gridRuntime.grid;
 
-  // Bootstrap pings must finish before the first MOVE/getSet, otherwise
+  // Live peer / request activity for the Aggregate Nodes side panel.
+  if (gridRuntime.network) {
+    const net = gridRuntime.network;
+    if (typeof net.setActivityHandler === "function") {
+      net.setActivityHandler((ev) => {
+        self.postMessage({ type: "NETWORK_ACTIVITY", payload: ev });
+      });
+    }
+    if (typeof net.setPeersHandler === "function") {
+      net.setPeersHandler((peers) => {
+        self.postMessage({
+          type: "NETWORK_PEERS",
+          payload: { peers, routingKey: readRoutingKey(net) },
+        });
+      });
+    }
+  }
+
+  // Bootstrap pings must finish before the first MOVE/getSets, otherwise
+  // sticky ingress has an empty peer table.
   // the table is empty and discoverPeers races with auth Headers.
   if (typeof gridRuntime.network?.whenReady === "function") {
     await gridRuntime.network.whenReady();
+  }
+  if (typeof gridRuntime.network?.listPeers === "function") {
+    self.postMessage({
+      type: "NETWORK_PEERS",
+      payload: {
+        peers: gridRuntime.network.listPeers(),
+        routingKey: readRoutingKey(gridRuntime.network),
+      },
+    });
   }
 
   const cubeRuntime = createCubeRuntime(
@@ -2397,6 +2631,7 @@ async function handleInit(payload) {
   }
 
   self.postMessage({ type: "INIT_COMPLETE" });
+  scheduleReconcileIdle();
 }
 
 function handleMove(payload) {
@@ -2422,6 +2657,7 @@ function handleMove(payload) {
   lastStrictBoundsSerialized = payload.strictBounds || bounds;
 
   grid.move(zoom, deserializeBounds(bounds, grid.space));
+  pruneCubePastViewportLod();
 
   // Camera change MUST flush ASAP: the renderer reads the live matrix
   // every frame, and if the pack still holds cells at the previous
@@ -2429,6 +2665,7 @@ function handleMove(payload) {
   // the new pack arrives. cube.display() hash-caches → if no bracket
   // cross happened this is essentially free.
   requestImmediateFlush();
+  scheduleReconcileDebounced();
   perfRecord("handleMove", nowMs() - start, {
     pendingIngest: pendingIngest.size,
   });

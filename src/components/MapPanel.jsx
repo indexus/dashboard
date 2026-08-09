@@ -73,8 +73,8 @@ export default function MapPanel({
   theme = "dark",
   normalizer = DEFAULT_NORMALIZER,
   hoverHit = null,
-  onRefresh,
-  refreshBusy = false,
+  zoom: zoomProp,
+  onViewportChange,
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -89,12 +89,14 @@ export default function MapPanel({
   const fittingRef = useRef(false);
   const onMapClickRef = useRef(onMapClick);
   const onHitFocusRef = useRef(onHitFocus);
+  const onViewportChangeRef = useRef(onViewportChange);
   hitsRef.current = hits;
   originRef.current = origin;
   normalizerRef.current = normalizer;
   hoverKeyRef.current = hitHoverKey(hoverHit);
   onMapClickRef.current = onMapClick;
   onHitFocusRef.current = onHitFocus;
+  onViewportChangeRef.current = onViewportChange;
 
   const paintHits = (map, mode) => {
     applyHitsOverlay(
@@ -142,13 +144,21 @@ export default function MapPanel({
       container: containerRef.current,
       style: MAP_STYLES[mode].url,
       center: center || [2.3522, 48.8566],
-      zoom: 11,
+      zoom: Number.isFinite(zoomProp) ? zoomProp : 11,
       projection: "mercator",
     });
     map.addControl(
       new maplibregl.NavigationControl({ showCompass: false }),
       "top-right",
     );
+
+    const emitViewport = () => {
+      const cb = onViewportChangeRef.current;
+      if (!cb) return;
+      const c = map.getCenter();
+      cb([c.lng, c.lat], map.getZoom());
+    };
+    map.on("moveend", emitViewport);
 
     map.on("click", (e) => {
       const feats = map.queryRenderedFeatures(e.point, {
@@ -178,6 +188,7 @@ export default function MapPanel({
       loadedModeRef.current = mode;
       paintHits(map, mode);
       map.resize();
+      emitViewport();
     });
     mapRef.current = map;
 
@@ -304,17 +315,6 @@ export default function MapPanel({
     <div className={`map-wrap map-wrap--${mode}`}>
       <div className="map-el" ref={containerRef} />
       <div className="map-mode-badge">nearby</div>
-      {onRefresh ? (
-        <button
-          type="button"
-          className="map-refresh-btn"
-          disabled={refreshBusy}
-          onClick={onRefresh}
-          title="Refresh peers and remount Nearby"
-        >
-          Refresh
-        </button>
-      ) : null}
       <div
         className="heatmap-legend"
         title={`prix/m² · normalizer ${normalizer}`}

@@ -1,6 +1,5 @@
 import axios from "axios";
 
-import { Space } from "../entities/space.js";
 import { Peer } from "../network/peer.js";
 import { getHostFromIP } from "../utilities/network.js";
 import { authHeaders } from "./authHeaders.js";

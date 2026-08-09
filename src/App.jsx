@@ -13,6 +13,7 @@ import {
   addGeoItem,
   bootstrapHost,
   COLLECTION_PRESETS,
+  DEFAULT_READ_OPTIONS,
   DETAIL_LIMIT,
   ensureToken,
   formatDistanceKm,
@@ -49,6 +50,11 @@ export default function App() {
   const [auto, setAuto] = useState(true);
   const [step, setStep] = useState(10);
   const [normalizer, setNormalizer] = useState(10000);
+  /** Shared Nearby + Aggregate `/sets` navigation and batching. */
+  const [readNavigation, setReadNavigation] = useState(
+    DEFAULT_READ_OPTIONS.navigation,
+  );
+  const [readMethod, setReadMethod] = useState(DEFAULT_READ_OPTIONS.method);
   const [detailLimit] = useState(DETAIL_LIMIT);
   const [origin, setOrigin] = useState({ lat: 48.8566, lng: 2.3522 });
   const [itemId, setItemId] = useState("");
@@ -76,6 +82,11 @@ export default function App() {
   const originKeyRef = useRef("");
   const autoTimerRef = useRef(null);
   const searchGenRef = useRef(0);
+  /** Last Aggregate / Nearby camera — Refresh remounts without jumping to default. */
+  const mapViewportRef = useRef({
+    aggregate: { center: [2.3522, 48.8566], zoom: 6 },
+    nearby: { center: [2.3522, 48.8566], zoom: 11 },
+  });
 
   const boot = health?.boot || mesh?.boot || null;
   const bootHost = useMemo(
@@ -125,26 +136,61 @@ export default function App() {
     }
   }, []);
 
-  // Ops / header: keep mesh + peers fresh. Data tab does not remount on this.
+  // Keep mesh fresh on both tabs — Ops every 3s, Data every 5s (nodes looked
+  // stale when Data only polled health).
   useEffect(() => {
     tick();
-    if (tab !== "ops") return undefined;
-    const id = setInterval(tick, 3000);
+    const ms = tab === "ops" ? 3000 : 5000;
+    const id = setInterval(tick, ms);
     return () => clearInterval(id);
   }, [tick, tab]);
 
-  // Light header health while on Data (no mesh fan-out that churns peers).
-  useEffect(() => {
-    if (tab === "ops") return undefined;
-    const id = setInterval(() => {
-      getHealth()
-        .then((h) => {
-          if (h) setHealth(h);
-        })
-        .catch(() => {});
-    }, 10000);
-    return () => clearInterval(id);
-  }, [tab]);
+  const onAggregateViewport = useCallback((center, zoom) => {
+    if (!Array.isArray(center) || center.length < 2) return;
+    if (!Number.isFinite(zoom)) return;
+    mapViewportRef.current.aggregate = {
+      center: [center[0], center[1]],
+      zoom,
+    };
+  }, []);
+
+  const onNearbyViewport = useCallback((center, zoom) => {
+    if (!Array.isArray(center) || center.length < 2) return;
+    if (!Number.isFinite(zoom)) return;
+    mapViewportRef.current.nearby = {
+      center: [center[0], center[1]],
+      zoom,
+    };
+  }, []);
+
+  const readOptions = useMemo(
+    () => ({
+      navigation: readNavigation,
+      method: readMethod,
+      refreshTtlMs: DEFAULT_READ_OPTIONS.refreshTtlMs,
+    }),
+    [readNavigation, readMethod],
+  );
+
+  const onReadNavigation = useCallback((value) => {
+    setReadNavigation(value === "direct" ? "direct" : "ingress");
+    sessionRef.current = null;
+    cumulativeRef.current = [];
+    setHits([]);
+    setAllHits([]);
+    setCanNext(false);
+    setDataEpoch((e) => e + 1);
+  }, []);
+
+  const onReadMethod = useCallback((value) => {
+    setReadMethod(value === "getSet" ? "getSet" : "getSets");
+    sessionRef.current = null;
+    cumulativeRef.current = [];
+    setHits([]);
+    setAllHits([]);
+    setCanNext(false);
+    setDataEpoch((e) => e + 1);
+  }, []);
 
   const resetData = useCallback(async () => {
     setBusy(true);
@@ -249,6 +295,7 @@ export default function App() {
             lat: origin.lat,
             lng: origin.lng,
             step,
+            readOptions,
           });
           cumulativeRef.current = [];
         }
@@ -278,7 +325,7 @@ export default function App() {
         if (gen === searchGenRef.current) setBusy(false);
       }
     },
-    [hosts, collection, origin.lat, origin.lng, step],
+    [hosts, collection, origin.lat, origin.lng, step, readOptions],
   );
 
   const loadNextHits = useCallback(() => {
@@ -387,7 +434,7 @@ export default function App() {
   return (
     <div className={`app theme-${theme}`}>
       <Header
-        error={!!pollErr}
+        error={pollErr}
         theme={theme}
         onTheme={setTheme}
         tab={tab}
@@ -396,6 +443,10 @@ export default function App() {
         onCollection={setCollection}
         mode={mode}
         onMode={onMode}
+        readNavigation={readNavigation}
+        onReadNavigation={onReadNavigation}
+        readMethod={readMethod}
+        onReadMethod={onReadMethod}
         peerHint={peerHint}
         onReset={resetData}
         busy={busy}
@@ -418,26 +469,27 @@ export default function App() {
           <div className="data-layout">
             {mode === "aggregate" ? (
               <AggregateHeatmap
-                key={`agg-${dataEpoch}-${collection}`}
+                key={`agg-${dataEpoch}-${collection}-${readNavigation}-${readMethod}`}
                 collection={collection}
                 hosts={hosts}
                 bearer={bearer}
                 detailLimit={detailLimit}
-                center={[origin.lng, origin.lat]}
-                zoom={6}
+                center={mapViewportRef.current.aggregate.center}
+                zoom={mapViewportRef.current.aggregate.zoom}
                 theme={theme}
                 onStatus={onAggStatus}
                 onAddClick={() => setAddOpen(true)}
                 sideView={sideView}
                 onSideView={setSideView}
-                onRefresh={resetData}
-                refreshBusy={busy}
+                onViewportChange={onAggregateViewport}
+                readOptions={readOptions}
               />
             ) : (
               <>
                 <MapPanel
                   key={`near-${dataEpoch}`}
-                  center={[origin.lng, origin.lat]}
+                  center={mapViewportRef.current.nearby.center}
+                  zoom={mapViewportRef.current.nearby.zoom}
                   origin={origin}
                   hits={displayHits}
                   onMapClick={onMapClick}
@@ -447,8 +499,7 @@ export default function App() {
                   theme={theme}
                   normalizer={normalizer}
                   hoverHit={hoveredHit}
-                  onRefresh={resetData}
-                  refreshBusy={busy}
+                  onViewportChange={onNearbyViewport}
                 />
                 <DataSidePanel
                   view={sideView}

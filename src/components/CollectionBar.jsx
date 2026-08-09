@@ -11,6 +11,10 @@ export default function CollectionBar({
   onCollection,
   mode,
   onMode,
+  readNavigation,
+  onReadNavigation,
+  readMethod,
+  onReadMethod,
   peerHint,
   onReset,
   busy,
@@ -77,6 +81,32 @@ export default function CollectionBar({
                 </option>
               ))}
             </datalist>
+          </label>
+
+          <label className="data-toolbar-field tight">
+            <span className="sr-only">read navigation</span>
+            <select
+              value={readNavigation}
+              onChange={(e) => onReadNavigation?.(e.target.value)}
+              aria-label="Read navigation"
+              title="direct: the client follows zone owners with deep=false redirects. ingress: one sticky peer near the session key deep-fills server-side. Shared by Nearby and Aggregate."
+            >
+              <option value="direct">direct</option>
+              <option value="ingress">ingress</option>
+            </select>
+          </label>
+
+          <label className="data-toolbar-field tight">
+            <span className="sr-only">read granularity</span>
+            <select
+              value={readMethod}
+              onChange={(e) => onReadMethod?.(e.target.value)}
+              aria-label="Read granularity"
+              title="getSets: many parents coalesced into shared batches. getSet: one location per request. Both speak the same /sets protocol."
+            >
+              <option value="getSets">getSets</option>
+              <option value="getSet">getSet</option>
+            </select>
           </label>
 
           {onReset ? (

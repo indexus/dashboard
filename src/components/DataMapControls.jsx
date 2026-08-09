@@ -222,8 +222,19 @@ export default function DataMapControls({
           value={metrics?.avgEuroM2Label ?? "—"}
         />
         <MetricRow
+          label="items zones parentes"
+          tip="Somme des counts Abelian des zones parentes visibles dans le viewport (pondérée par l’intersection des bounds)."
+          value={
+            metrics?.parentItemTotal != null && metrics.parentItemTotal > 0
+              ? metrics.parentItemTotal.toLocaleString("fr-FR")
+              : metrics?.visibleItemCount != null && metrics.visibleItemCount > 0
+                ? metrics.visibleItemCount.toLocaleString("fr-FR")
+                : "—"
+          }
+        />
+        <MetricRow
           label="transactions"
-          tip="Nombre de transactions (ventes) agrégées dans le viewport."
+          tip="Nombre de transactions (ventes) agrégées dans le viewport (alias DVF du total items)."
           value={metrics?.transactions ?? "—"}
         />
         <MetricRow
@@ -232,8 +243,8 @@ export default function DataMapControls({
           value={metrics?.instances ?? 0}
         />
         <MetricRow
-          label="items visibles"
-          tip="Count d’items derrière les zones visibles — pilote la bascule heatmap ↔ points via le seuil items."
+          label="seuil bascule"
+          tip="Count pondéré utilisé pour la bascule heatmap ↔ points (seuil items)."
           value={metrics?.visibleItemCount ?? "—"}
         />
       </Group>

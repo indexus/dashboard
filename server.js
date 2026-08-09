@@ -41,11 +41,13 @@ const PUBLIC = path.join(__dirname, "public");
 const CORE_ROOT = process.env.INDEXUS_CORE_ROOT
   ? path.resolve(process.env.INDEXUS_CORE_ROOT)
   : path.resolve(__dirname, "../core");
-const LOCAL_SPAWNED_DIR = path.join(CORE_ROOT, ".data-local", "spawned");
+const LOCAL_DATA_DIR = path.join(CORE_ROOT, ".data-local");
+const LOCAL_SPAWNED_DIR = path.join(LOCAL_DATA_DIR, "spawned");
+const LOCAL_SNAPSHOT_DIR = path.join(LOCAL_DATA_DIR, "snapshots");
 const LOCAL_TERMINATE = path.join(CORE_ROOT, "scripts", "local", "terminate.sh");
 const LOCAL_MESH_UP = path.join(CORE_ROOT, "scripts", "local", "mesh_up.sh");
-const LOCAL_KEYS_DIR = path.join(CORE_ROOT, ".data-local", "keys");
-const MESH_CONFIG_PATH = path.join(CORE_ROOT, ".data-local", "mesh-config.env");
+const LOCAL_KEYS_DIR = path.join(LOCAL_DATA_DIR, "keys");
+const MESH_CONFIG_PATH = path.join(LOCAL_DATA_DIR, "mesh-config.env");
 const P2P_PORT = parseInt(process.env.P2P_PORT || "21000", 10);
 
 /** @type {{ running: boolean, startedAt: number|null, log: string, error: string|null, ok: boolean|null }} */
@@ -57,10 +59,11 @@ const remeshJob = {
   ok: null,
 };
 
-/** @type {{ running: boolean, abort: boolean, progress: object|null, result: object|null, error: string|null, startedAt: number|null }} */
+/** @type {{ running: boolean, abort: boolean, paused: boolean, progress: object|null, result: object|null, error: string|null, startedAt: number|null }} */
 const dvfJob = {
   running: false,
   abort: false,
+  paused: false,
   progress: null,
   result: null,
   error: null,
@@ -203,7 +206,7 @@ function liveMeshConfig() {
   return meshConfigFromNode(boot);
 }
 
-function startRemesh({ keepSnapshots = true } = {}) {
+function startRemesh({ keepSnapshots = false } = {}) {
   if (remeshJob.running) {
     const err = new Error("remesh already running");
     err.status = 409;
@@ -220,11 +223,25 @@ function startRemesh({ keepSnapshots = true } = {}) {
   remeshJob.error = null;
   remeshJob.ok = null;
 
+  // Clean & Restart: delete object-store snapshots before mesh_up so a
+  // leftover DirStore (zones/, nodes/) cannot resurrect after reboot.
+  if (!keepSnapshots) {
+    try {
+      fs.rmSync(LOCAL_SNAPSHOT_DIR, { recursive: true, force: true });
+      remeshJob.log += `wiped ${LOCAL_SNAPSHOT_DIR}\n`;
+    } catch (e) {
+      remeshJob.log += `snapshot wipe warning: ${e.message || e}\n`;
+    }
+  }
+
   const child = spawnProc("bash", [LOCAL_MESH_UP], {
     cwd: CORE_ROOT,
     env: {
       ...process.env,
+      // Force the remesh intent — do not inherit a stale KEEP_SNAPSHOTS=1.
       KEEP_SNAPSHOTS: keepSnapshots ? "1" : "0",
+      SNAPSHOT_DIR: LOCAL_SNAPSHOT_DIR,
+      INDEXUS_SNAPSHOT_DIR: LOCAL_SNAPSHOT_DIR,
       MESH_CONFIG: MESH_CONFIG_PATH,
     },
   });
@@ -389,11 +406,17 @@ function nodeFromStatus(ip, status, monPort, extra = {}) {
     cpu_pct: round1(p.cpu_pct),
     mem_pct: round1(p.mem_pct),
     mem_projected: round1(p.mem_projected),
+    disk_free_pct: round1(p.disk_free_pct),
     inserts_window: p.inserts_window ?? a.inserts_window ?? null,
     last_reason: a.last_reason || "",
+    admit_blocked: !!a.admit_blocked,
+    rising_fast: !!a.rising_fast,
     scale_ups_done: a.scale_ups_done ?? 0,
     up_in_flight: !!a.up_in_flight,
     down_in_flight: !!a.down_in_flight,
+    items_limit: a.items_limit ?? null,
+    queue_abs: a.queue_abs ?? null,
+    disk_min_free: a.disk_min_free ?? null,
     leaving: !!status.leaving,
     client_ready: status.client_ready !== false,
     rebalancing: !!status.rebalancing,
@@ -602,6 +625,9 @@ async function sampleMesh() {
       ? {
           mem_limit_pct: bootNode.mem_limit_pct,
           cpu_limit_pct: bootNode.cpu_limit_pct,
+          items_limit: bootNode.items_limit,
+          queue_abs: bootNode.queue_abs,
+          disk_min_free: bootNode.disk_min_free,
         }
       : null,
   };
@@ -797,11 +823,13 @@ const server = http.createServer(async (req, res) => {
         else if (!fs.existsSync(MESH_CONFIG_PATH)) {
           writeMeshConfigFile(liveMeshConfig());
         }
-        startRemesh({ keepSnapshots: body.keep_snapshots !== false });
+        // Only keep snapshots when explicitly requested (Clean & Restart → false).
+        const keepSnapshots = body.keep_snapshots === true;
+        startRemesh({ keepSnapshots });
         return sendJSON(res, 202, {
           ok: true,
           started: true,
-          keep_snapshots: body.keep_snapshots !== false,
+          keep_snapshots: keepSnapshots,
           path: MESH_CONFIG_PATH,
           remesh: {
             running: remeshJob.running,
@@ -900,6 +928,7 @@ const server = http.createServer(async (req, res) => {
     if (url === "/api/dvf/status" && req.method === "GET") {
       return sendJSON(res, 200, {
         running: dvfJob.running,
+        paused: !!dvfJob.paused,
         progress: dvfJob.progress,
         result: dvfJob.result,
         error: dvfJob.error,
@@ -910,11 +939,37 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (url === "/api/dvf/pause" && req.method === "POST") {
+      if (!dvfJob.running) {
+        return sendJSON(res, 409, { error: "no DVF load running" });
+      }
+      dvfJob.paused = true;
+      return sendJSON(res, 200, { ok: true, paused: true, running: true });
+    }
+
+    if (url === "/api/dvf/resume" && req.method === "POST") {
+      if (!dvfJob.running) {
+        return sendJSON(res, 409, { error: "no DVF load running" });
+      }
+      dvfJob.paused = false;
+      return sendJSON(res, 200, { ok: true, paused: false, running: true });
+    }
+
+    if (url === "/api/dvf/stop" && req.method === "POST") {
+      if (!dvfJob.running) {
+        return sendJSON(res, 409, { error: "no DVF load running" });
+      }
+      dvfJob.abort = true;
+      dvfJob.paused = false;
+      return sendJSON(res, 200, { ok: true, stopping: true });
+    }
+
     if (url === "/api/dvf/load" && req.method === "POST") {
       if (dvfJob.running) {
         return sendJSON(res, 409, {
           error: "DVF load already running",
           progress: dvfJob.progress,
+          paused: !!dvfJob.paused,
         });
       }
       if (!bootIp) return sendJSON(res, 503, { error: "no bootstrap" });
@@ -963,6 +1018,7 @@ const server = http.createServer(async (req, res) => {
 
       dvfJob.running = true;
       dvfJob.abort = false;
+      dvfJob.paused = false;
       dvfJob.progress = {
         phase: "queued",
         limit: limit ?? "full",
@@ -983,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
         route,
         limit: limit ?? undefined,
         shouldAbort: () => dvfJob.abort,
+        shouldPause: () => dvfJob.paused,
         onProgress: (info) => {
           dvfJob.progress = info;
         },
@@ -990,10 +1047,12 @@ const server = http.createServer(async (req, res) => {
         .then((result) => {
           dvfJob.result = result;
           dvfJob.running = false;
+          dvfJob.paused = false;
         })
         .catch((e) => {
           dvfJob.error = String(e.message || e);
           dvfJob.running = false;
+          dvfJob.paused = false;
         });
 
       return sendJSON(res, 202, {
@@ -1047,7 +1106,7 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`  ISSUER_URL=${resolveIssuer() || "(from BOOT_IP:22000)"}`);
   console.log(`  static: ${staticRoot()}`);
   console.log(
-    `  APIs: /api/mesh · /api/token · /api/spawn · /api/downscale · /api/terminate · /api/mesh-config · /api/remesh · /api/snapshots/* · /api/dvf/*`,
+    `  APIs: /api/mesh · /api/token · /api/spawn · /api/downscale · /api/terminate · /api/mesh-config · /api/remesh · /api/snapshots/* · /api/dvf/{load,status,pause,resume,stop}`,
   );
   console.log(`  DVF_DATA_DIR=${defaultDvfDataDir()}`);
   pollLoop();
