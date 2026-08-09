@@ -6,6 +6,16 @@ import { ROOT, zoneKey } from "../utilities/encoding.js";
 
 import { project, refresh, consolidate, process, reconcileVisible } from "./layer.js";
 
+/**
+ * Aggregate drill engine.
+ *
+ * Two LRU caches sit on the Aggregate path and must not be confused:
+ * - `network._cache` — raw `/sets` children keyed by zoneKey (wire shape).
+ * - `grid.cache` — geometry-enriched processed children for the drill.
+ *
+ * Invalidating one without the other leaves stale half-state; use
+ * {@link invalidateZone} when dropping a zone from both.
+ */
 class Grid {
   constructor(collection, space, options, stream, finish, monitoring, network) {
     this.collection = collection;
@@ -61,20 +71,18 @@ class Grid {
   }
 
   /**
+   * himo.place drill: floor depth, fire-and-forget refresh so MOVE returns
+   * immediately while the tree walk streams into the cube.
+   *
    * @param {number} zoom
    * @param {any} bounds
    * @param {{ force?: boolean }} [opts] — force=true re-drills even if the
-   *   viewport hash is unchanged (needed after reconcile replaceBranch).
+   *   viewport hash is unchanged (manual Refresh / reconcile replaceBranch).
    */
   async move(zoom, bounds, opts = {}) {
-    // Hash precision must cover cube.display's xyz LOD (zoom+resolution).
-    // ceil avoids short-drilling (e.g. xyz target 11 → need 4 chars, not 3).
-    const targetXyz = Math.floor(
-      zoom + this.options.resolution + this.options.offset.zoom
-    );
-    const depth = Math.max(
-      0,
-      Math.ceil(targetXyz / Math.max(1, this.space.step))
+    const depth = Math.floor(
+      (zoom + this.options.resolution + this.options.offset.zoom) /
+        Math.max(1, this.space.step)
     );
     const hash = this.space.encode(this.space.center(bounds), depth);
 
@@ -87,7 +95,9 @@ class Grid {
     const id = crypto.randomUUID();
     this.current = { hash, id };
 
-    await this.refresh(id, [this.root], this.project(zoom, bounds), depth);
+    // Do not await — interactive pans cancel via current.id; finish() runs
+    // when this wave completes (same as himo.place).
+    void this.refresh(id, [this.root], this.project(zoom, bounds), depth);
   }
 
   getGeometry(location) {
@@ -143,6 +153,19 @@ class Grid {
     if (collection == null || location == null) return;
     this.cache.delete(zoneKey(collection, location));
   }
+}
+
+/**
+ * Drop a zone from Network wire cache and Grid processed cache together.
+ * @param {{ invalidate?: Function } | null | undefined} network
+ * @param {{ invalidate?: Function } | null | undefined} grid
+ * @param {string} collection
+ * @param {string} location
+ */
+export function invalidateZone(network, grid, collection, location) {
+  if (collection == null || location == null) return;
+  network?.invalidate?.(collection, location);
+  grid?.invalidate?.(collection, location);
 }
 
 Grid.prototype.project = project;

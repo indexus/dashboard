@@ -27,6 +27,15 @@ function activityOpacity(lastActiveAt, now, inFlight) {
   return 1 - (age - HOT_MS) / FADE_MS;
 }
 
+function samePeerList(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].host !== b[i].host || a[i].ingress !== b[i].ingress) return false;
+  }
+  return true;
+}
+
 /**
  * Aggregate / Data side panel: known client peers + live request pulse.
  *
@@ -48,45 +57,57 @@ export default function NodesList({
     if (!controller?.subscribeNetwork) return undefined;
     return controller.subscribeNetwork((snap) => {
       const list = Array.isArray(snap?.peers) ? snap.peers : [];
-      setPeers(list);
+      // Identity changes on every worker message; only re-render on real
+      // membership changes or the map fights the pan for frames.
+      setPeers((prev) => (samePeerList(prev, list) ? prev : list));
       setRoutingKey((prev) => snap?.routingKey ?? prev);
 
-      const activity = snap?.activity;
-      if (!activity?.host && !activity?.hash) return;
-
-      const key = activity.host || `${activity.ip}|${activity.port}` || activity.hash;
-      if (!key) return;
+      const events = Array.isArray(snap?.activityEvents)
+        ? snap.activityEvents
+        : snap?.activity
+          ? [snap.activity]
+          : [];
+      let touched = false;
       const map = stateRef.current;
-      let row = map.get(key);
-      if (!row) {
-        row = {
-          key,
-          hash: activity.hash || null,
-          ip: activity.ip || null,
-          port: activity.port || null,
-          host: activity.host || key,
-          inFlight: 0,
-          lastActiveAt: 0,
-          lastMethod: null,
-          lastOk: null,
-        };
-        map.set(key, row);
-      }
-      if (activity.hash) row.hash = activity.hash;
-      if (activity.ip) row.ip = activity.ip;
-      if (activity.port != null) row.port = activity.port;
-      if (activity.host) row.host = activity.host;
-      row.lastMethod = activity.method || row.lastMethod;
+      const at = performance.now();
 
-      if (activity.phase === "start") {
-        row.inFlight += 1;
-        row.lastActiveAt = performance.now();
-      } else if (activity.phase === "end") {
-        row.inFlight = Math.max(0, row.inFlight - 1);
-        row.lastActiveAt = performance.now();
-        row.lastOk = activity.ok !== false;
+      for (const activity of events) {
+        if (!activity?.host && !activity?.hash) continue;
+        const key =
+          activity.host || `${activity.ip}|${activity.port}` || activity.hash;
+        if (!key) continue;
+        let row = map.get(key);
+        if (!row) {
+          row = {
+            key,
+            hash: activity.hash || null,
+            ip: activity.ip || null,
+            port: activity.port || null,
+            host: activity.host || key,
+            inFlight: 0,
+            lastActiveAt: 0,
+            lastMethod: null,
+            lastOk: null,
+          };
+          map.set(key, row);
+        }
+        if (activity.hash) row.hash = activity.hash;
+        if (activity.ip) row.ip = activity.ip;
+        if (activity.port != null) row.port = activity.port;
+        if (activity.host) row.host = activity.host;
+        row.lastMethod = activity.method || row.lastMethod;
+
+        if (activity.phase === "start") {
+          row.inFlight += 1;
+          row.lastActiveAt = at;
+        } else if (activity.phase === "end") {
+          row.inFlight = Math.max(0, row.inFlight - 1);
+          row.lastActiveAt = at;
+          row.lastOk = activity.ok !== false;
+        }
+        touched = true;
       }
-      setTick((n) => n + 1);
+      if (touched) setTick((n) => n + 1);
     });
   }, [controller]);
 

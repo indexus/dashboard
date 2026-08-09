@@ -1,6 +1,7 @@
 /**
- * Nearby (Local → getSet) and Aggregate (Grid → getSets) read through the same
- * Network: one ingress, one cache, one `/sets` wire format.
+ * Nearby (Local → getSet/getSets) and Aggregate (Grid → getSets) share the same
+ * Network *code path*: one `/sets` wire format and zone-cache implementation.
+ * A single live Network+cache is shared only when both hold the same instance.
  */
 
 import test from "node:test";

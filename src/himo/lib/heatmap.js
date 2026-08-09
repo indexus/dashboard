@@ -12,11 +12,13 @@ export const COLLECTION_DEFAULTS = {
   metricLngOffset: 180,
   metricMaxIndex: 63,
   normalizer: 10000,
-  pointOverlayMaxPoints: 200,
+  // himo.place discrete overlay threshold.
+  pointOverlayMaxPoints: 1000,
   cubeSubdivisionLimit: 5,
   cubeChildrenThreshold: 4,
   childVirtualizationEnabled: false,
-  algorithmResolution: 6,
+  // himo.place drill/display resolution (dashboard had drifted to 6).
+  algorithmResolution: 5,
   parentFallbackDepth: 6,
   heatmapVisualMultiplier: 2.5,
   heatmapVisualAreaMode: AREA_MODE_DISK,

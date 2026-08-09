@@ -5,22 +5,20 @@
 
 import {
   Cube,
-  Collection,
-  Space,
   API,
   Network,
   Grid,
 } from "../../js-indexus-sdk/index.js";
+import { buildCollectionAndSpace } from "./collection.js";
 
-function buildCollectionAndSpace(definition) {
-  const collection = new Collection(definition.name, definition.dimensions);
-  const space = new Space(
-    collection.dimensions(),
-    collection.mask(),
-    collection.offset()
-  );
-  return { collection, space };
-}
+export { buildCollectionAndSpace, buildGpsCollection, GPS_DIM } from "./collection.js";
+export {
+  buildNetworkConfig,
+  buildSetsPoolOptions,
+  createDashboardNetwork,
+  dashboardP2pGateway,
+} from "./networkFactory.js";
+export { DEFAULT_READ_OPTIONS, MESH_DISCOVERY_INTERVAL_MS } from "./readDefaults.js";
 
 export function createCubeRuntime(definition, cubeOptions, isCovered) {
   const { collection, space } = buildCollectionAndSpace(definition);

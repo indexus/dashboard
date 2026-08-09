@@ -36,11 +36,13 @@ import {
   whitenBackdropRoadLabels,
 } from "@himo/components/mapStyle.js";
 
+import { DETAIL_LIMIT } from "../lib/sdk.js";
+import { GPS_DIM } from "../himo/lib/indexus/collection.js";
+import { buildNetworkConfig } from "../himo/lib/indexus/networkFactory.js";
 import {
-  GPS_DIM,
-  DETAIL_LIMIT,
   DEFAULT_READ_OPTIONS,
-} from "../lib/sdk.js";
+  MESH_DISCOVERY_INTERVAL_MS,
+} from "../himo/lib/indexus/readDefaults.js";
 import {
   POINT_LAYER_ID,
   applyPointOverlay,
@@ -54,6 +56,7 @@ import DataSidePanel, {
   pointsToHits,
 } from "./DataSidePanel.jsx";
 import NodesList from "./NodesList.jsx";
+import ClientMetrics from "./ClientMetrics.jsx";
 
 function popupHtmlFromHit(hit) {
   const title = hitTitle(hit);
@@ -131,8 +134,19 @@ const GRID_OPT = {
   offset: { zoom: 0, bounds: 0 },
   resolution: COLLECTION_DEFAULTS.algorithmResolution,
   stream: { progressive: true },
+  // Chunks go out in parallel (see prefetchCollectionSpatialChunks); keep each
+  // request modest so XOR-wrong batches do not redirect hundreds of locations.
+  // himo.place: serial viewport-ranked prefetch chunks of 40.
   network: { spatialPrefetchChunkSize: 40 },
+  // Wire/cache spam: leave off. Use `"sets,refresh,reconcile"` to trace reads.
+  // DEBUG_LOG posts to the main thread — leave false while interacting.
+  debugSdk: false,
 };
+
+// Keep the main-thread gate in sync with the worker INIT flag (separate realms).
+if (typeof globalThis !== "undefined" && globalThis.__INDEXUS_DEBUG__ == null) {
+  globalThis.__INDEXUS_DEBUG__ = GRID_OPT.debugSdk;
+}
 
 const POINT_OVERLAY = {
   maxPoints: COLLECTION_DEFAULTS.pointOverlayMaxPoints,
@@ -510,6 +524,8 @@ export default function AggregateHeatmap({
   const [pointHits, setPointHits] = useState([]);
   const [selectedPoint, setSelectedPoint] = useState(null);
   const [nodeCount, setNodeCount] = useState(0);
+  /** Badge on the Metrics tab — cached sets count. */
+  const [metricsHint, setMetricsHint] = useState(null);
   const [normalizer, setNormalizerState] = useState(
     normalizerProp ?? DVF_NORMALIZER,
   );
@@ -566,19 +582,18 @@ export default function AggregateHeatmap({
     [collection],
   );
 
+  // Same Network construction as Nearby (gateway + read knobs), different
+  // concurrency/cache — built in the worker via createGridRuntime, not here.
   const network = useMemo(
-    () => ({
-      protocol: "http",
-      peers: bearer ? peers : [],
-      concurrency: 100,
-      cacheSize: 50000,
-      setsPool: {
-        navigation: readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
-        method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
-        refreshTtlMs:
-          readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
-      },
-    }),
+    () =>
+      buildNetworkConfig({
+        peers: bearer ? peers : [],
+        // himo.place Aggregate network sizing.
+        concurrency: 100,
+        cacheSize: 50000,
+        readOptions: readOptions ?? DEFAULT_READ_OPTIONS,
+        meshDiscoveryIntervalMs: MESH_DISCOVERY_INTERVAL_MS,
+      }),
     [
       peers,
       bearer,
@@ -760,6 +775,10 @@ export default function AggregateHeatmap({
     const unsub = controller.subscribeNetwork?.((snap) => {
       const n = Array.isArray(snap?.peers) ? snap.peers.length : 0;
       setNodeCount((prev) => (prev === n ? prev : n));
+      const cached = snap?.metrics?.cacheSize;
+      const hint =
+        Number.isFinite(cached) && cached > 0 ? String(cached) : null;
+      setMetricsHint((prev) => (prev === hint ? prev : hint));
     });
     return () => unsub?.();
   }, [controller]);
@@ -913,6 +932,11 @@ export default function AggregateHeatmap({
               en attente des peers…
             </div>
           }
+          metrics={
+            <div className="hit meta" style={{ color: "var(--fog)" }}>
+              en attente du client…
+            </div>
+          }
         />
       </div>
     );
@@ -1015,9 +1039,11 @@ export default function AggregateHeatmap({
         onAddClick={onAddClick}
         itemCount={overlayMode === "points" ? pointHits.length : 0}
         nodeCount={nodeCount}
+        metricsHint={metricsHint}
         controls={controls}
         items={itemsPanel}
         nodes={<NodesList controller={controller} />}
+        metrics={<ClientMetrics controller={controller} />}
       />
     </div>
   );

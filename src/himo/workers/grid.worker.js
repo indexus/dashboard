@@ -76,7 +76,15 @@ import {
   createCubeRuntime,
   createGridRuntime,
 } from "../lib/indexus/runtime";
-import { setDebug } from "../js-indexus-sdk/index.js";
+import {
+  deltaTickCommit,
+  shouldPruneAfterDeltaPass,
+} from "../lib/indexus/deltaTickRule.js";
+import {
+  setDebug,
+  setDebugSink,
+  debugLog,
+} from "../js-indexus-sdk/index.js";
 import {
   BYTES_PER_INSTANCE,
   FLOATS_PER_INSTANCE,
@@ -101,11 +109,11 @@ const COLLECTION_DEFAULTS = {
   metricLngOffset: 180,
   metricMaxIndex: 63,
   normalizer: 10000,
-  pointOverlayMaxPoints: 200,
+  pointOverlayMaxPoints: 1000,
   cubeSubdivisionLimit: 5,
   cubeChildrenThreshold: 4,
   childVirtualizationEnabled: false,
-  algorithmResolution: 6,
+  algorithmResolution: 5,
   parentFallbackDepth: 6,
   heatmapVisualMultiplier: 2.5,
   heatmapVisualAreaMode: 0,
@@ -202,6 +210,27 @@ const RECONCILE_DEBOUNCE_MS = 1000;
  * the next tick.
  */
 const RECONCILE_IDLE_MS = 10000;
+/**
+ * Periodic delta tick (runDeltaTick). Unlike the old auto-reconcile it never
+ * touches the MOVE path: armed from `finish` only, gated on camera settle and
+ * drill in-flight, budgeted to a sliver of the `/sets` pool, never redrills,
+ * and commits exactly one dataVersion bump + one flush per pass so a change
+ * lands as a single WebGL blend. The RECONCILE message (Refresh button) still
+ * runs the full runReconcile(true).
+ */
+const AUTO_DELTA_ENABLED = true;
+/** Read budget of one delta tick — leftovers wait for the next tick. */
+const DELTA_TICK_MAX_READS = 48;
+/** replaceBranch budget of one delta tick (bounds worker CPU per pass). */
+const DELTA_TICK_MAX_PARENTS = 12;
+/** `/sets` slots a delta tick may hold, out of the shared pool (~100). */
+const DELTA_TICK_DIG_CONCURRENCY = 8;
+/**
+ * Ceiling on how long an interactive drill is believed to still be running.
+ * `finish` is skipped for a superseded drill and never runs for a thrown one,
+ * so the in-flight claim must expire or reconcile would stop for good.
+ */
+const MOVE_DRILL_MAX_MS = 15000;
 const EMPTY_PACK_HOLD_MS = 1800;
 const PERF_SPIKE_THRESHOLD_MS = 22;
 const PERF_SNAPSHOT_MS = 2000;
@@ -352,6 +381,22 @@ let reconcileInFlight = false;
 let reconcilePendingForce = null;
 /** True while the repair pass is driving its own viewport re-drill. */
 let redrillInFlight = false;
+/**
+ * Timestamp of the interactive `grid.move` drill still walking the tree, or 0.
+ * Reconcile reads it to stay off `/sets` while the camera drill owns it: a
+ * repair `grid.move` shares `current.id` and would cancel that drill outright.
+ */
+let moveDrillAt = 0;
+/** Periodic NETWORK_METRICS push for the Metrics side tab. */
+let metricsTimer = null;
+/**
+ * Request activity is telemetry, not data: it is batched on a timer so a
+ * drill cannot turn into one main-thread render per `/sets`.
+ */
+const ACTIVITY_FLUSH_MS = 200;
+const ACTIVITY_BATCH_MAX = 64;
+let pendingActivity = [];
+let activityTimer = null;
 const pendingIngest = new Map();
 let ingestCellsPerTick = INGEST_INITIAL_CELLS_PER_TICK;
 let perfDebugEnabled = true;
@@ -657,8 +702,44 @@ function resetIngestQueue() {
   }
 }
 
+function stopMetricsTimer() {
+  if (metricsTimer != null) {
+    clearInterval(metricsTimer);
+    metricsTimer = null;
+  }
+  if (activityTimer != null) {
+    clearTimeout(activityTimer);
+    activityTimer = null;
+  }
+  pendingActivity = [];
+}
+
+/** Post one batch of request activity per ACTIVITY_FLUSH_MS, never per request. */
+function scheduleActivityFlush() {
+  if (activityTimer != null) return;
+  activityTimer = setTimeout(() => {
+    activityTimer = null;
+    if (pendingActivity.length === 0) return;
+    const batch = pendingActivity;
+    pendingActivity = [];
+    self.postMessage({
+      type: "NETWORK_ACTIVITY",
+      payload: { events: batch, latest: batch[batch.length - 1] },
+    });
+  }, ACTIVITY_FLUSH_MS);
+}
+
+/** An interactive drill is walking the tree and owns `/sets`. */
+function moveDrillInFlight() {
+  return moveDrillAt > 0 && nowMs() - moveDrillAt < MOVE_DRILL_MAX_MS;
+}
+
 function stopReconcileTimers() {
   redrillInFlight = false;
+  moveDrillAt = 0;
+  reconcileInFlight = false;
+  reconcilePendingForce = null;
+  stopMetricsTimer();
   if (reconcileDebounceTimer != null) {
     clearTimeout(reconcileDebounceTimer);
     reconcileDebounceTimer = null;
@@ -670,34 +751,179 @@ function stopReconcileTimers() {
 }
 
 function scheduleReconcileDebounced() {
+  if (!AUTO_DELTA_ENABLED) {
+    debugLog("reconcile", "debounce skipped — auto delta off");
+    return;
+  }
   // A drill the repair itself started is not user movement: re-arming the
   // short debounce here is what turned one repair into a permanent one.
   if (redrillInFlight) {
+    debugLog("reconcile", "debounce skipped — redrill owns idle", {
+      idleMs: RECONCILE_IDLE_MS,
+    });
     scheduleReconcileIdle();
     return;
   }
-  // Debounced MOVE repair supersedes any pending idle tick.
+  // Debounced post-drill tick supersedes any pending idle tick.
   if (reconcileIdleTimer != null) {
     clearTimeout(reconcileIdleTimer);
     reconcileIdleTimer = null;
   }
   if (reconcileDebounceTimer != null) clearTimeout(reconcileDebounceTimer);
+  debugLog("reconcile", "delta debounce armed", { ms: RECONCILE_DEBOUNCE_MS });
   reconcileDebounceTimer = setTimeout(() => {
     reconcileDebounceTimer = null;
-    void runReconcile(false);
+    void runDeltaTick();
   }, RECONCILE_DEBOUNCE_MS);
 }
 
-/** Arm the next idle repair for RECONCILE_IDLE_MS after now (post-completion). */
+/** Arm the next delta tick for RECONCILE_IDLE_MS after now (post-completion). */
 function scheduleReconcileIdle() {
+  if (!AUTO_DELTA_ENABLED) {
+    debugLog("reconcile", "idle skipped — auto delta off");
+    return;
+  }
   if (reconcileIdleTimer != null) {
     clearTimeout(reconcileIdleTimer);
     reconcileIdleTimer = null;
   }
+  debugLog("reconcile", "delta idle armed", { ms: RECONCILE_IDLE_MS });
   reconcileIdleTimer = setTimeout(() => {
     reconcileIdleTimer = null;
-    void runReconcile(false);
+    debugLog("reconcile", "delta idle fired", { ms: RECONCILE_IDLE_MS });
+    void runDeltaTick();
   }, RECONCILE_IDLE_MS);
+}
+
+/**
+ * Periodic delta pass: detect zone count changes / splits / merges and land
+ * them as ONE WebGL blend, without ever touching the interactive MOVE path.
+ *
+ * Contrasts with runReconcile (manual Refresh):
+ * - never redrills (`grid.move` shares current.id with the interactive drill
+ *   and used to cancel pans — "move dead");
+ * - tight budgets (reads/replaces) + a `/sets` concurrency cap so a pan that
+ *   starts mid-pass finds the pool free;
+ * - one dataVersion bump per pass, even when a MOVE aborts it mid-mutation
+ *   (the next flush must cross-fade the partial state, not snap it);
+ * - prune-only never bumps (LOD trim is a snap, not a data transition).
+ */
+async function runDeltaTick() {
+  if (!grid || !cube) return;
+  if (reconcileInFlight) {
+    // A manual Refresh owns the pass; its `finally` re-arms the idle tick.
+    debugLog("reconcile", "delta skipped — pass already in flight");
+    return;
+  }
+  if (nowMs() - lastMoveAtMs < RECONCILE_DEBOUNCE_MS) {
+    debugLog("reconcile", "delta skipped — camera settling", {
+      sinceMoveMs: Math.round(nowMs() - lastMoveAtMs),
+      needMs: RECONCILE_DEBOUNCE_MS,
+    });
+    scheduleReconcileIdle();
+    return;
+  }
+  if (moveDrillInFlight()) {
+    debugLog("reconcile", "delta skipped — interactive drill owns /sets", {
+      drillMs: Math.round(nowMs() - moveDrillAt),
+    });
+    scheduleReconcileIdle();
+    return;
+  }
+  if (lastZoom == null || !lastBoundsSerialized) {
+    // No re-arm: `finish` seeds the viewport and arms the first tick.
+    debugLog("reconcile", "delta skipped — no viewport yet");
+    return;
+  }
+
+  // This run owns the idle schedule; re-arm only after it finishes.
+  if (reconcileIdleTimer != null) {
+    clearTimeout(reconcileIdleTimer);
+    reconcileIdleTimer = null;
+  }
+
+  reconcileInFlight = true;
+  const startedAt = nowMs();
+  try {
+    const bounds = deserializeBounds(lastBoundsSerialized, grid.space);
+    const keepResolution = Math.floor(lastZoom + algorithmResolution) + 1;
+
+    // The camera wins: on MOVE the walk stops at the next zone boundary and
+    // the leftovers wait for the next tick.
+    const moveMark = lastMoveAtMs;
+    const result = await grid.reconcileVisible(lastZoom, bounds, cube, {
+      keepResolution,
+      shouldStop: () => lastMoveAtMs !== moveMark,
+      // Ride the Network refresh floor/TTL — a quiet mesh costs one `@` read.
+      force: false,
+      maxReads: DELTA_TICK_MAX_READS,
+      maxParents: DELTA_TICK_MAX_PARENTS,
+      digConcurrencyCap: DELTA_TICK_DIG_CONCURRENCY,
+    });
+    if (typeof grid.network?.noteReconcile === "function") {
+      grid.network.noteReconcile({
+        dirty: result?.dirty ?? 0,
+        rootDelta: (result?.rootAfter ?? 0) - (result?.rootBefore ?? 0),
+        ms: Math.round(nowMs() - startedAt),
+      });
+    }
+    const mutated = !!(result?.mutated || (result?.dirty ?? 0) > 0);
+    const aborted = lastMoveAtMs !== moveMark;
+    const pruned = shouldPruneAfterDeltaPass({
+      aborted,
+      drillInFlight: moveDrillInFlight(),
+    })
+      ? pruneCubePastViewportLod()
+      : 0;
+    // One bump per pass — kept even on abort so the MOVE's flush blends the
+    // partially-applied delta instead of snapping it. Prune-only never bumps.
+    const commit = deltaTickCommit({ mutated, pruned });
+    if (commit.bumpDataVersion) {
+      dataVersion += 1;
+    }
+    debugLog("reconcile", "delta tick end", {
+      dirty: result?.dirty ?? 0,
+      mutated,
+      aborted,
+      pruned,
+      zonesRead: result?.zonesRead ?? 0,
+      rootBefore: result?.rootBefore,
+      rootAfter: result?.rootAfter,
+      keepResolution,
+      dataVersion,
+      ms: Math.round(nowMs() - startedAt),
+    });
+    if (commit.flush) {
+      // Force metrics recompute on next pack even if camera key is unchanged.
+      viewportMetricsState = {
+        key: "",
+        totalCount: 0,
+        metricSums: [],
+        viewportDvf: viewportDvfFromMetricSums(0, []),
+      };
+      requestImmediateFlush();
+    }
+  } catch (error) {
+    console.warn("[aggregate.delta] tick failed:", error);
+    debugLog("reconcile", "delta tick failed", {
+      error: String(error?.message || error),
+      ms: Math.round(nowMs() - startedAt),
+    });
+  } finally {
+    reconcileInFlight = false;
+    const pending = reconcilePendingForce;
+    reconcilePendingForce = null;
+    if (pending !== null) {
+      // A Refresh was clicked mid-tick; run it now, it re-arms idle itself.
+      debugLog("reconcile", "delta handing off to pending refresh", {
+        force: pending,
+      });
+      void runReconcile(pending);
+    } else {
+      // Next tick counts from completion — passes never overlap.
+      scheduleReconcileIdle();
+    }
+  }
 }
 
 /**
@@ -710,15 +936,35 @@ async function runReconcile(force = false) {
     if (reconcilePendingForce === null || force) {
       reconcilePendingForce = force;
     }
+    debugLog("reconcile", "skipped — already in flight", {
+      force,
+      pendingForce: reconcilePendingForce,
+    });
     return;
   }
   if (!force && nowMs() - lastMoveAtMs < RECONCILE_DEBOUNCE_MS) {
     // Camera still settling — retry after the idle gap from now.
+    debugLog("reconcile", "skipped — camera settling", {
+      sinceMoveMs: Math.round(nowMs() - lastMoveAtMs),
+      needMs: RECONCILE_DEBOUNCE_MS,
+    });
+    scheduleReconcileIdle();
+    return;
+  }
+  // The camera drill outlives the MOVE event that started it: the debounce
+  // above expires mid-drill, and reconciling here would either fight it for
+  // connections or cancel it through a shared `current.id`. `finish` re-arms.
+  if (!force && moveDrillInFlight()) {
+    debugLog("reconcile", "skipped — interactive drill owns /sets", {
+      drillMs: Math.round(nowMs() - moveDrillAt),
+    });
     scheduleReconcileIdle();
     return;
   }
   if (lastZoom == null || !lastBoundsSerialized) {
-    scheduleReconcileIdle();
+    // No re-arm: there is nothing to repair until a camera exists, and
+    // handleMove + finish seed the viewport the moment it lands.
+    debugLog("reconcile", "skipped — no viewport yet");
     return;
   }
 
@@ -730,19 +976,58 @@ async function runReconcile(force = false) {
 
   reconcileInFlight = true;
   reconcilePendingForce = null;
+  const startedAt = nowMs();
+  debugLog("reconcile", "pass start", {
+    force,
+    zoom: lastZoom,
+    navigation: grid.network?.readOptions?.()?.navigation,
+    method: grid.network?.readOptions?.()?.method,
+  });
   try {
     const bounds = deserializeBounds(lastBoundsSerialized, grid.space);
-    const result = await grid.reconcileVisible(lastZoom, bounds, cube);
-    if (result?.dirty > 0) {
+    const keepResolution = Math.floor(lastZoom + algorithmResolution) + 1;
+
+    // The camera wins: a MOVE lands on a stale viewport, so stop the walk and
+    // let the debounce re-run it against the new bounds.
+    const moveMark = lastMoveAtMs;
+    const result = await grid.reconcileVisible(lastZoom, bounds, cube, {
+      keepResolution,
+      shouldStop: () => lastMoveAtMs !== moveMark,
+      // A user-triggered RECONCILE must reach the nodes; the periodic pass
+      // stays behind the Network refresh floor.
+      force,
+    });
+    if (typeof grid.network?.noteReconcile === "function") {
+      grid.network.noteReconcile({
+        dirty: result?.dirty ?? 0,
+        rootDelta: (result?.rootAfter ?? 0) - (result?.rootBefore ?? 0),
+        ms: Math.round(nowMs() - startedAt),
+      });
+    }
+    let redrilled = false;
+    const rootMoved = result?.rootAfter !== result?.rootBefore;
+    const mutated = !!(result?.mutated || (result?.dirty ?? 0) > 0);
+    const cameraMovedDuringPass = lastMoveAtMs !== moveMark;
+    // Drop cells finer than the Aggregate display band (z-1..z+1).
+    const pruned = pruneCubePastViewportLod();
+    // Mutate and prune both need a dataVersion bump so flushAndPack arms a
+    // prev→cur WebGL blend (prune-only used to snap with displayChanged and
+    // no version advance).
+    if (mutated || pruned > 0) {
       dataVersion += 1;
-      // The re-drill re-reads the whole viewport, and its `finish` arms another
-      // repair. Branches replaced without moving the visible total are the
-      // pruned deep tiers the display band drops anyway, so re-drilling them
-      // only feeds the next pass the same work.
-      if (result.rootAfter !== result.rootBefore) {
-        // replaceBranch may have swapped a shallow shadow — force a full
-        // viewport drill so the cube re-descends to zoom+resolution.
+    }
+    if (mutated) {
+      // Only redrill when a deep replaceBranch moved the root total AND the
+      // user did not pan mid-pass. A forced grid.move here shares current.id
+      // with the interactive drill and was cancelling pans ("move dead").
+      if (
+        (result?.dirty ?? 0) > 0 &&
+        rootMoved &&
+        !cameraMovedDuringPass &&
+        nowMs() - lastMoveAtMs >= RECONCILE_DEBOUNCE_MS
+      ) {
         redrillInFlight = true;
+        redrilled = true;
         try {
           await grid.move(lastZoom, bounds, { force: true });
         } catch (moveErr) {
@@ -755,9 +1040,23 @@ async function runReconcile(force = false) {
         }
       }
     }
-    // Drop cells finer than the Aggregate display band (z-1..z+1).
-    const pruned = pruneCubePastViewportLod();
-    if (result?.dirty > 0 || pruned > 0) {
+    const rootDelta = (result?.rootAfter ?? 0) - (result?.rootBefore ?? 0);
+    debugLog("reconcile", "pass end", {
+      dirty: result?.dirty ?? 0,
+      mutated,
+      rootDelta,
+      zonesRead: result?.zonesRead ?? 0,
+      rootBefore: result?.rootBefore,
+      rootAfter: result?.rootAfter,
+      keepResolution,
+      pruned,
+      redrilled,
+      cameraMovedDuringPass,
+      dataVersion,
+      transitionActive,
+      ms: Math.round(nowMs() - startedAt),
+    });
+    if (mutated || rootMoved || pruned > 0) {
       // Force metrics recompute on next pack even if camera key is unchanged.
       viewportMetricsState = {
         key: "",
@@ -769,12 +1068,17 @@ async function runReconcile(force = false) {
     }
   } catch (error) {
     console.warn("[aggregate.refresh] reconcile failed:", error);
+    debugLog("reconcile", "pass failed", {
+      error: String(error?.message || error),
+      ms: Math.round(nowMs() - startedAt),
+    });
   } finally {
     reconcileInFlight = false;
     const pending = reconcilePendingForce;
     reconcilePendingForce = null;
     if (pending !== null) {
       // Follow-up runs now; it will arm idle when *it* finishes.
+      debugLog("reconcile", "running pending follow-up", { force: pending });
       void runReconcile(pending);
     } else {
       // 10s quiet after this repair completed (even if it ran long).
@@ -938,15 +1242,13 @@ function flushAndPack() {
     return; // Display + position style unchanged → skip pack.
   }
 
-  // Continuous-transition rule — see TRANSITION_DURATION_MS on main for timing.
+  // Continuous-transition rule (himo.place) — TRANSITION_DURATION_MS on main.
   //
   // • Data-ingest freezes `previousDisplay` once; subsequent batches in the same
   //   stream keep RAF factor ticking (PACKED.dataDriven=false).
   //
-  // • LOD bracket crosses `floor(zoom + resolutionConstant)` do NOT start a
-  //   snapshot blend: ACCUM_SHADER already uses float `liveDepth` and packs
-  //   three tiers so zoom stays smooth without resetting transitionFactor on
-  //   each integer hop (regresses "restart from whole zoom" feel).
+  // • LOD bracket crosses do NOT start a snapshot blend: ACCUM_SHADER uses
+  //   float `liveDepth` and packs three tiers.
   //
   // • Pure viewport/LOD geometry updates: swap packs immediately; only real
   //   `dataVersion` changes trigger prev/cur snapshot cross-fade.
@@ -2451,6 +2753,11 @@ self.onmessage = async (event) => {
         handleTransitionComplete(payload);
         break;
 
+      case "RECONCILE":
+        // Explicit Refresh: seed (or re-drill) to resolution, then deltas.
+        void runReconcile(true);
+        break;
+
       default:
         console.warn("[grid.worker] unknown command:", type);
     }
@@ -2468,9 +2775,23 @@ async function handleInit(payload) {
 
   // The whole read path runs in here, so the SDK channels are worthless unless
   // the flag crosses with INIT — the main thread's global is a different realm.
+  // Mirror every line back to the page console (worker console is easy to miss).
+  setDebugSink((channel, event, fields) => {
+    try {
+      self.postMessage({
+        type: "DEBUG_LOG",
+        payload: { channel, event, fields: fields ?? null, at: Date.now() },
+      });
+    } catch {
+      /* ignore */
+    }
+  });
   if (payload.debugSdk !== undefined) {
     setDebug(payload.debugSdk);
   }
+  debugLog("reconcile", "sdk debug channels", {
+    debugSdk: payload.debugSdk ?? false,
+  });
 
   resetIngestQueue();
   stopReconcileTimers();
@@ -2535,11 +2856,15 @@ async function handleInit(payload) {
     payload.gridOpt,
     gridStreamOutput,
     // `finish` callback: flush stream chunks immediately but keep ingest
-    // non-blocking to avoid stalling interaction frames. Also schedule a
-    // debounced Abelian reconcile once the MOVE drill settles.
+    // non-blocking to avoid stalling interaction frames.
     () => {
+      // himo.place finish: flush + ingest, release the drill claim. Then —
+      // and only then — arm the delta debounce: during a continuous pan the
+      // next MOVE re-sets lastMoveAtMs and the settle gate pushes the tick
+      // out, so it never runs while the user is interacting.
       stream.flushNow();
       scheduleIngest();
+      moveDrillAt = 0;
       scheduleReconcileDebounced();
     },
     NOOP_MONITORING,
@@ -2551,8 +2876,13 @@ async function handleInit(payload) {
   if (gridRuntime.network) {
     const net = gridRuntime.network;
     if (typeof net.setActivityHandler === "function") {
+      // Coalesced: a drill fires hundreds of events per second and each one
+      // used to cross to the main thread and re-render the side panel, which
+      // is what stole frames from the map during a pan.
       net.setActivityHandler((ev) => {
-        self.postMessage({ type: "NETWORK_ACTIVITY", payload: ev });
+        pendingActivity.push(ev);
+        if (pendingActivity.length > ACTIVITY_BATCH_MAX) pendingActivity.shift();
+        scheduleActivityFlush();
       });
     }
     if (typeof net.setPeersHandler === "function") {
@@ -2562,6 +2892,19 @@ async function handleInit(payload) {
           payload: { peers, routingKey: readRoutingKey(net) },
         });
       });
+    }
+    if (typeof net.setMetricsHandler === "function") {
+      net.setMetricsHandler((snap) => {
+        self.postMessage({ type: "NETWORK_METRICS", payload: snap });
+      });
+      // Keep the Metrics tab fresh even when the mesh is quiet.
+      if (metricsTimer != null) clearInterval(metricsTimer);
+      metricsTimer = setInterval(() => {
+        if (typeof net.readMetrics === "function") {
+          self.postMessage({ type: "NETWORK_METRICS", payload: net.readMetrics() });
+        }
+      }, 1000);
+      self.postMessage({ type: "NETWORK_METRICS", payload: net.readMetrics() });
     }
   }
 
@@ -2622,16 +2965,21 @@ async function handleInit(payload) {
 
   // Replay any MOVE that arrived during the await above.
   if (pendingMove) {
-    const { zoom, bounds } = pendingMove;
+    const { zoom, bounds, strictBounds } = pendingMove;
     pendingMove = null;
+    lastMoveAtMs = nowMs();
+    moveDrillAt = lastMoveAtMs;
     lastZoom = zoom;
     lastBoundsSerialized = bounds;
+    lastStrictBoundsSerialized = strictBounds || bounds;
     grid.move(zoom, deserializeBounds(bounds, grid.space));
     requestImmediateFlush();
   }
 
   self.postMessage({ type: "INIT_COMPLETE" });
-  scheduleReconcileIdle();
+  // Do not arm delta reconcile here. A pending MOVE (or the first camera
+  // event) must own `/sets` until finish seeds the viewport; otherwise the
+  // idle pass races the drill and move looks dead.
 }
 
 function handleMove(payload) {
@@ -2644,10 +2992,11 @@ function handleMove(payload) {
     return;
   }
 
-  // Keep cells from the in-flight move — they're often still inside
-  // the new viewport and dropping them was visibly removing borders
-  // during fast zoom.
+  // himo.place MOVE path: flush stream, fire-and-forget drill, immediate
+  // pack. No prune / reconcile — those fought transitions and pans.
   lastMoveAtMs = nowMs();
+  redrillInFlight = false;
+  moveDrillAt = lastMoveAtMs;
   stream.flushNow();
   scheduleIngest();
 
@@ -2657,7 +3006,6 @@ function handleMove(payload) {
   lastStrictBoundsSerialized = payload.strictBounds || bounds;
 
   grid.move(zoom, deserializeBounds(bounds, grid.space));
-  pruneCubePastViewportLod();
 
   // Camera change MUST flush ASAP: the renderer reads the live matrix
   // every frame, and if the pack still holds cells at the previous
@@ -2665,7 +3013,6 @@ function handleMove(payload) {
   // the new pack arrives. cube.display() hash-caches → if no bracket
   // cross happened this is essentially free.
   requestImmediateFlush();
-  scheduleReconcileDebounced();
   perfRecord("handleMove", nowMs() - start, {
     pendingIngest: pendingIngest.size,
   });

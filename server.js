@@ -14,8 +14,11 @@
  *   PORT          dashboard listen port, default 3847
  *   POLL_MS       server-side poll interval, default 3000
  *   HISTORY_MS    rolling sample window, default 12m
+ *   P2P_PROTOCOL  http|https for /api/p2p/:port fan-out (default http).
+ *                 https needs INDEXUS_P2P_TLS=1 on the local mesh (HTTP/2).
  */
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn as spawnProc } from "node:child_process";
@@ -49,6 +52,24 @@ const LOCAL_MESH_UP = path.join(CORE_ROOT, "scripts", "local", "mesh_up.sh");
 const LOCAL_KEYS_DIR = path.join(LOCAL_DATA_DIR, "keys");
 const MESH_CONFIG_PATH = path.join(LOCAL_DATA_DIR, "mesh-config.env");
 const P2P_PORT = parseInt(process.env.P2P_PORT || "21000", 10);
+/** Backend scheme for the Aggregate same-origin peer gateway. */
+const P2P_PROTOCOL =
+  process.env.P2P_PROTOCOL === "https" || process.env.INDEXUS_P2P_TLS === "1"
+    ? "https"
+    : "http";
+
+const p2pHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 128,
+  maxFreeSockets: 64,
+});
+const p2pHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 128,
+  maxFreeSockets: 64,
+  // Local mesh uses a lab self-signed cert when INDEXUS_P2P_TLS=1.
+  rejectUnauthorized: false,
+});
 
 /** @type {{ running: boolean, startedAt: number|null, log: string, error: string|null, ok: boolean|null }} */
 const remeshJob = {
@@ -681,12 +702,78 @@ function contentType(file) {
   return "application/octet-stream";
 }
 
+/**
+ * Fan-out Aggregate/Nearby peer calls through one browser origin.
+ * Path: /api/p2p/:port/sets|ping|... → {P2P_PROTOCOL}://127.0.0.1:port/...
+ */
+function proxyP2p(req, res) {
+  const raw = req.url || "/";
+  const match = raw.match(/^\/api\/p2p\/(\d+)(\/[^?]*)(\?.*)?$/);
+  if (!match) {
+    sendJSON(res, 400, { error: "expected /api/p2p/:port/..." });
+    return;
+  }
+  const port = Number(match[1]);
+  if (!(port >= 1 && port <= 65535)) {
+    sendJSON(res, 400, { error: "invalid p2p port" });
+    return;
+  }
+  const peerPath = match[2] || "/";
+  const query = match[3] || "";
+  const ip = bootIp || "127.0.0.1";
+  const lib = P2P_PROTOCOL === "https" ? https : http;
+  const agent = P2P_PROTOCOL === "https" ? p2pHttpsAgent : p2pHttpAgent;
+  const headers = { ...req.headers, host: `${ip}:${port}` };
+  delete headers["connection"];
+  delete headers["content-length"];
+
+  const upstream = lib.request(
+    {
+      protocol: `${P2P_PROTOCOL}:`,
+      hostname: ip,
+      port,
+      path: `${peerPath}${query}`,
+      method: req.method,
+      headers,
+      agent,
+      timeout: 60_000,
+    },
+    (up) => {
+      const outHeaders = { ...up.headers };
+      // Browser talks same-origin; still expose ingress hints for the SDK.
+      res.writeHead(up.statusCode || 502, outHeaders);
+      up.pipe(res);
+    }
+  );
+  upstream.on("timeout", () => {
+    upstream.destroy();
+    if (!res.headersSent) sendJSON(res, 504, { error: "p2p upstream timeout" });
+  });
+  upstream.on("error", (err) => {
+    if (!res.headersSent) {
+      sendJSON(res, 502, {
+        error: "p2p upstream unavailable",
+        detail: err.code || err.message,
+        target: `${P2P_PROTOCOL}://${ip}:${port}${peerPath}`,
+      });
+    }
+  });
+  req.pipe(upstream);
+}
+
 const server = http.createServer(async (req, res) => {
   const url = (req.url || "/").split("?")[0];
 
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Indexus-Routing-Key"
+  );
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "X-Indexus-Ingress-Name, X-Indexus-Ingress-IP, X-Indexus-Ingress-Port"
+  );
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     res.end();
@@ -694,6 +781,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (url.startsWith("/api/p2p/")) {
+      return proxyP2p(req, res);
+    }
+
     if (url === "/api/mesh" && req.method === "GET") {
       if (!cache) await sampleMesh();
       return sendJSON(res, 200, cache || { error: "warming" });
@@ -706,6 +797,8 @@ const server = http.createServer(async (req, res) => {
         issuer: resolveIssuer(),
         mon_port: MON_PORT,
         p2p_port: P2P_PORT,
+        p2p_protocol: P2P_PROTOCOL,
+        p2p_gateway: "/api/p2p",
         bootstrap: bootIp ? `${bootIp}|${P2P_PORT}` : null,
         poll_error: pollError,
         static_root: path.basename(staticRoot()),

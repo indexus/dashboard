@@ -13,9 +13,11 @@
 //                    SET_ALGO_RESOLUTION, SET_POLYGON_FILTER_ENABLED,
 //                    SET_VALUE_METRIC_INDEX, SET_CHILD_VIRTUALIZATION
 //   INIT.payload.debugHeatmap — optional console diagnostics ([heatmap-worker], …).
-//   INIT.payload.debugSdk     — SDK read-path channels ([indexus:sets|refresh|cube]).
+//   INIT.payload.debugSdk     — SDK read-path channels
+//                               ([indexus:sets|refresh|cube|reconcile]).
 //   worker → main:  INIT_COMPLETE, PACKED, VIEWPORT_METRICS, PERF_DEBUG,
-//                    NETWORK_PEERS, NETWORK_ACTIVITY, ERROR
+//                    NETWORK_PEERS, NETWORK_ACTIVITY, NETWORK_METRICS,
+//                    DEBUG_LOG, ERROR
 //
 // PACKED carries a Float32Array as a transferable, pooled inside the
 // worker — we send the buffer back via RELEASE_PACKED when a newer one
@@ -52,10 +54,9 @@ const POINT_COLOR_THRESHOLD = 200;
 // short grace keeps the heatmap visible across that gap, then we let
 // the empty pack through if the gap persists (genuinely-empty viewport).
 const EMPTY_PACK_GRACE_MS = 300;
-/** Hold heatmap/points invisible after INIT while coarse LOD packs stream
- *  in and the cube descends to the configured detail — avoids a colour flash
- *  of large parent sets before finer tiers arrive. */
-const INITIAL_LOD_REVEAL_MS = 2000;
+/** himo.place paints as soon as the first PACKED arrives (0). A multi-second
+ *  gate hid early transition blends and made Aggregate look slower than himo. */
+const INITIAL_LOD_REVEAL_MS = 0;
 const NOOP = () => {};
 const EMPTY_PACKED = { count: 0, data: null, snapshotVersion: 0 };
 
@@ -154,7 +155,11 @@ export function useGridWorker({
   const latestPointsRef = useRef(EMPTY_POINTS);
   const pointSubscribersRef = useRef(new Set());
   const networkSubscribersRef = useRef(new Set());
-  const latestNetworkRef = useRef({ peers: [], activity: null });
+  const latestNetworkRef = useRef({
+    peers: [],
+    activity: null,
+    metrics: null,
+  });
   // Timestamp (Date.now()) until which we'll keep showing the previous
   // packed snapshot if the worker reports `instanceCount: 0`. Reset to
   // `now + EMPTY_PACK_GRACE_MS` every time a non-empty pack arrives, so
@@ -233,7 +238,7 @@ export function useGridWorker({
       { type: "module" }
     );
     workerRef.current = worker;
-    latestNetworkRef.current = { peers: [], activity: null };
+    latestNetworkRef.current = { peers: [], activity: null, metrics: null };
 
     // Gate the first paint until coarse parent sets have had time to
     // subdivide toward the configured resolution / zone threshold.
@@ -513,6 +518,10 @@ export function useGridWorker({
       payload: { value: value !== false },
     });
   }, []);
+  /** Explicit Refresh: seed viewport to resolution, then run count deltas. */
+  const requestReconcile = useCallback(() => {
+    workerRef.current?.postMessage({ type: "RECONCILE" });
+  }, []);
   // Stable controller object the WebGPU layer reads every frame.
   const controller = useMemo(
     () => ({
@@ -536,6 +545,7 @@ export function useGridWorker({
       setChildVirtualizationEnabled,
       setAlgorithmResolution,
       setNormalizer,
+      requestReconcile,
       debugHeatmap: gridOpt?.debugHeatmap === true,
     }),
     [
@@ -559,11 +569,18 @@ export function useGridWorker({
       setChildVirtualizationEnabled,
       setAlgorithmResolution,
       setNormalizer,
+      requestReconcile,
       gridOpt?.debugHeatmap,
     ]
   );
 
-  return { controller, handleMapMove, onPolygonLoaded, registerRepaint };
+  return {
+    controller,
+    handleMapMove,
+    onPolygonLoaded,
+    registerRepaint,
+    requestReconcile,
+  };
 }
 
 function handleWorkerMessage(event, ctx) {
@@ -808,10 +825,36 @@ function handleWorkerMessage(event, ctx) {
     }
 
     case "NETWORK_ACTIVITY": {
+      // The worker batches: one message carries every request that happened
+      // in its flush window, so the panel still pulses each node it touched.
+      const events = Array.isArray(payload?.events)
+        ? payload.events
+        : payload
+          ? [payload]
+          : [];
+      if (events.length === 0) break;
       ctx.latestNetworkRef.current = {
         ...ctx.latestNetworkRef.current,
-        activity: payload || null,
+        activity: payload?.latest ?? events[events.length - 1],
+        activityEvents: events,
         activityAt: performance.now(),
+      };
+      // No console mirror here — `[indexus:sets] wire request|response` already
+      // covers the same events when debugSdk includes "sets".
+      for (const sub of ctx.networkSubscribersRef.current) {
+        try {
+          sub(ctx.latestNetworkRef.current);
+        } catch {
+          /* ignore */
+        }
+      }
+      break;
+    }
+
+    case "NETWORK_METRICS": {
+      ctx.latestNetworkRef.current = {
+        ...ctx.latestNetworkRef.current,
+        metrics: payload || null,
       };
       for (const sub of ctx.networkSubscribersRef.current) {
         try {
@@ -819,6 +862,17 @@ function handleWorkerMessage(event, ctx) {
         } catch {
           /* ignore */
         }
+      }
+      break;
+    }
+
+    case "DEBUG_LOG": {
+      const channel = payload?.channel || "?";
+      const event = payload?.event || "";
+      if (payload?.fields) {
+        console.info(`[indexus:${channel}] ${event}`, payload.fields);
+      } else {
+        console.info(`[indexus:${channel}] ${event}`);
       }
       break;
     }

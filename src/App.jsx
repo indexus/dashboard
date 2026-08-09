@@ -47,7 +47,8 @@ export default function App() {
   const [collection, setCollection] = useState(COLLECTION_PRESETS[0].id);
   const [mode, setMode] = useState("aggregate");
   const [sideView, setSideView] = useState("controls");
-  const [auto, setAuto] = useState(true);
+  // Off by default — auto Nearby re-queries pollute network/metrics vs Aggregate.
+  const [auto, setAuto] = useState(false);
   const [step, setStep] = useState(10);
   const [normalizer, setNormalizer] = useState(10000);
   /** Shared Nearby + Aggregate `/sets` navigation and batching. */
@@ -527,7 +528,7 @@ export default function App() {
                       selected={selectedCell}
                       onFocus={onHitFocus}
                       onHover={setHoveredHit}
-                      empty={auto ? "auto-querying…" : "click map, then Query"}
+                      empty={auto ? "auto-querying…" : "click map, then Query / Next"}
                       onLoadMore={loadNextHits}
                       hasMore={canNext}
                       loadingMore={busy}

@@ -3,7 +3,7 @@ import { formatDistanceKm } from "../lib/sdk.js";
 import { useOverlayScroll } from "../lib/overlayScroll.js";
 
 /**
- * Right-hand Data panel: Contrôles ↔ Items ↔ Nodes
+ * Right-hand Data panel: Contrôles ↔ Items ↔ Nodes ↔ Metrics
  * for both Nearby and Aggregate.
  */
 export default function DataSidePanel({
@@ -12,15 +12,24 @@ export default function DataSidePanel({
   controls,
   items,
   nodes = null,
+  metrics = null,
   itemCount = 0,
   nodeCount = 0,
+  metricsHint = null,
   onAddClick,
   controlsLabel = "Contrôles",
   itemsLabel = "Items",
   nodesLabel = "Nodes",
+  metricsLabel = "Metrics",
 }) {
   const bodyRef = useOverlayScroll([view]);
   const showNodes = nodes != null;
+  const showMetrics = metrics != null;
+
+  let body = items;
+  if (view === "controls") body = controls;
+  else if (view === "nodes" && showNodes) body = nodes;
+  else if (view === "metrics" && showMetrics) body = metrics;
 
   return (
     <aside className="data-side" aria-label="data side panel">
@@ -61,6 +70,20 @@ export default function DataSidePanel({
               ) : null}
             </button>
           ) : null}
+          {showMetrics ? (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === "metrics"}
+              className={view === "metrics" ? "active" : ""}
+              onClick={() => onView("metrics")}
+            >
+              {metricsLabel}
+              {metricsHint != null && metricsHint !== "" ? (
+                <span className="data-side-count">{metricsHint}</span>
+              ) : null}
+            </button>
+          ) : null}
         </div>
         {onAddClick ? (
           <button
@@ -75,11 +98,7 @@ export default function DataSidePanel({
         ) : null}
       </div>
       <div className="data-side-body scroll-fade" ref={bodyRef}>
-        {view === "controls"
-          ? controls
-          : view === "nodes" && showNodes
-            ? nodes
-            : items}
+        {body}
       </div>
     </aside>
   );

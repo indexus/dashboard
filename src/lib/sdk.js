@@ -1,13 +1,17 @@
+import { Local } from "../himo/js-indexus-sdk/index.js";
 import {
-  Collection,
-  Space,
-  Local,
-  API,
-  Network,
-} from "../himo/js-indexus-sdk/index.js";
+  GPS_DIM,
+  buildGpsCollection,
+} from "../himo/lib/indexus/collection.js";
+import { createDashboardNetwork } from "../himo/lib/indexus/networkFactory.js";
+import {
+  DEFAULT_READ_OPTIONS,
+  MESH_DISCOVERY_INTERVAL_MS,
+} from "../himo/lib/indexus/readDefaults.js";
 import { issueToken } from "./api.js";
 
-export const GPS_DIM = { name: "gps", type: "spherical", args: [-90, 90, -180, 180] };
+export { GPS_DIM };
+export { DEFAULT_READ_OPTIONS, MESH_DISCOVERY_INTERVAL_MS };
 
 /** Cube early-stop: cells with count ≤ LIMIT become detail leaves (Aggregate worker). */
 export const DETAIL_LIMIT = 5;
@@ -36,14 +40,6 @@ export const VIEW_MODES = [
 /** metrics[2] — used by nearby summarizeItem (geo_load / DVF). */
 export const METRIC_VALUE_INDEX = 2;
 
-/** Default shared read configuration (Nearby + Aggregate). */
-export const DEFAULT_READ_OPTIONS = Object.freeze({
-  navigation: "direct",
-  method: "getSets",
-  /** Floor between two `refresh` reads of the same zone. */
-  refreshTtlMs: 5000,
-});
-
 /**
  * Zones the Nearby Network keeps. Local exploration walks far more than the
  * old 1000 before the user moves, and every eviction is a `/sets` we already
@@ -52,39 +48,22 @@ export const DEFAULT_READ_OPTIONS = Object.freeze({
 const NEARBY_CACHE_SIZE = 20000;
 
 /**
- * Nearby and Aggregate share one Network and one read configuration.
- * Local only needs getSet, which the Network answers from the same `/sets`
- * engine and cache Grid fills.
+ * Nearby and Aggregate share the same Network *code* and read knobs (gateway,
+ * navigation, method, TTL). They do **not** share one live instance: Nearby
+ * builds a Network on the main thread; Aggregate builds another inside the
+ * worker. Local and Grid both call getSets against whichever Network they hold.
  *
  * @param {string[]} hosts - mesh bootstrap hosts, `ip|port`
  * @param {{ navigation?: "ingress"|"direct", method?: "getSet"|"getSets" }} [readOptions]
  */
 async function connect(hosts, readOptions = DEFAULT_READ_OPTIONS) {
-  const bootstraps = [...new Set((hosts || []).filter(Boolean))];
-  if (!bootstraps.length) {
-    throw new Error("no mesh hosts — wait for /api/mesh nodes");
-  }
-
-  const network = new Network(
-    "http",
-    new API(),
-    bootstraps,
-    50,
-    NEARBY_CACHE_SIZE,
-    {
-      navigation: readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
-      method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
-      refreshTtlMs:
-        readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
-    },
-  );
-  await network.whenReady();
-  if (!network.listPeers().length) {
-    throw new Error(
-      `failed to ping any peer (${bootstraps.length} hosts: ${bootstraps.join(", ")})`,
-    );
-  }
-  return network;
+  return createDashboardNetwork({
+    hosts,
+    readOptions,
+    concurrency: 100,
+    cacheSize: NEARBY_CACHE_SIZE,
+    meshDiscoveryIntervalMs: MESH_DISCOVERY_INTERVAL_MS,
+  });
 }
 
 let tokenPromise = null;
@@ -136,9 +115,7 @@ export function hostsFromMesh(mesh, fallbackBootHost = null) {
 }
 
 export function buildCollection(name) {
-  const collection = new Collection(name, [GPS_DIM]);
-  const space = new Space(collection.dimensions(), collection.mask(), collection.offset());
-  return { collection, space, gps: space.dimension(0) };
+  return buildGpsCollection(name);
 }
 
 /** Haversine distance in kilometers (same formula as Spherical.pointDistance). */

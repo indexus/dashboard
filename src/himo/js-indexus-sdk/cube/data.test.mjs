@@ -61,6 +61,32 @@ describe("cube.set Abelian patch", () => {
     assert.equal(cell.children[0], childXyz);
   });
 
+  it("ignores float drift when the count is unchanged", () => {
+    // Same items, summed in a different child order: the low bits differ on
+    // essentially every cell. Patching on that comparison rewrote the cell and
+    // rolled an epsilon up to the root on every single delivery.
+    const cube = makeCubeHarness();
+    const parentXyz = { resolution: 0, coordinates: [0, 0] };
+    const cellXyz = { resolution: 1, coordinates: [0, 0] };
+    const local = 0.1 + 0.2 + 0.3;
+    const remote = 0.3 + 0.2 + 0.1;
+    assert.notEqual(local, remote, "fixture must actually differ in the low bits");
+
+    cube.add(create(parentXyz, { id: "parent" }, 5, [local], undefined, [cellXyz]));
+    cube.add(create(cellXyz, { id: "cell" }, 5, [local], undefined, [
+      { resolution: 2, coordinates: [0, 0] },
+    ]));
+
+    cube.set([create(cellXyz, { id: "cell" }, 5, [remote], undefined, [])]);
+
+    assert.equal(cube.get(cellXyz).metrics[0], local, "cell must not be patched");
+    assert.equal(
+      cube.get(parentXyz).metrics[0],
+      local,
+      "no epsilon may roll up to the ancestors"
+    );
+  });
+
   it("patches count/metrics but keeps children when Abelian differs", () => {
     const cube = makeCubeHarness();
     cube.add(
