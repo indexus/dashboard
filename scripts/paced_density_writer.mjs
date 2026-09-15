@@ -360,7 +360,6 @@ const initialPeers = await router.peers();
 const started = performance.now();
 const endAt = started + DURATION_S * 1000;
 let sequence = 0;
-let nextDue = started;
 
 function targetRps(elapsedS) {
   if (RPS_END === RPS_START || DURATION_S <= 0) return RPS_END;
@@ -370,6 +369,36 @@ function targetRps(elapsedS) {
       : DURATION_S;
   if (elapsedS >= rampS) return RPS_END;
   return RPS_START + (RPS_END - RPS_START) * (elapsedS / rampS);
+}
+
+function rampSeconds() {
+  return RAMP_SECONDS_ENV > 0 && RAMP_SECONDS_ENV < DURATION_S
+    ? RAMP_SECONDS_ENV
+    : DURATION_S;
+}
+
+// Return how many writes an ideal open-loop source has scheduled by elapsedS.
+// Integrating the linear rate avoids the zero-rate first interval becoming an
+// artificial 1,000 second sleep when a campaign starts at exactly 0 RPS.
+function scheduledWrites(elapsedS) {
+  if (RPS_END === RPS_START) return Math.max(0, elapsedS) * RPS_END;
+  const rampS = rampSeconds();
+  const t = Math.max(0, Math.min(elapsedS, rampS));
+  const ramp = RPS_START * t + ((RPS_END - RPS_START) * t * t) / (2 * rampS);
+  return elapsedS <= rampS ? ramp : ramp + (elapsedS - rampS) * RPS_END;
+}
+
+// Inverse of scheduledWrites: wall-clock offset for the nth scheduled write.
+function scheduledAt(index) {
+  if (RPS_END === RPS_START) return index / RPS_END;
+  const rampS = rampSeconds();
+  const slope = (RPS_END - RPS_START) / rampS;
+  const rampTotal = ((RPS_START + RPS_END) * rampS) / 2;
+  if (index <= rampTotal && Math.abs(slope) > Number.EPSILON) {
+    const disc = RPS_START * RPS_START + 2 * slope * index;
+    return (-RPS_START + Math.sqrt(Math.max(0, disc))) / slope;
+  }
+  return rampS + (index - rampTotal) / RPS_END;
 }
 
 console.log(
@@ -453,22 +482,30 @@ while (performance.now() < endAt) {
       peerCount = (await router.peers()).length;
     });
   }
-  const intervalMs = 1000 / Math.max(currentTarget, 0.001);
+  // Recompute from the integral each time. The schedule therefore follows a
+  // changing rate without carrying an obsolete interval from the start.
+  let nextDue = started + scheduledAt(sequence + 1) * 1000;
   if (now < nextDue) {
     await sleep(Math.min(5, nextDue - now));
     continue;
   }
   // Do not turn scheduler lag into a destructive catch-up burst.
-  if (now - nextDue > 250) nextDue = now;
+  if (now - nextDue > 250) {
+    const keepFrom = Math.floor(scheduledWrites(Math.max(0, elapsedS - 0.25)));
+    if (keepFrom > sequence) {
+      counters.dropped += keepFrom - sequence;
+      sequence = keepFrom;
+      nextDue = started + scheduledAt(sequence + 1) * 1000;
+      if (now < nextDue) continue;
+    }
+  }
   if (inflight >= MAX_INFLIGHT) {
     counters.dropped++;
     sequence++;
-    nextDue += intervalMs;
     continue;
   }
   counters.offered++;
   void send(sequence++);
-  nextDue += intervalMs;
 }
 
 const drainDeadline = performance.now() + 15000;
