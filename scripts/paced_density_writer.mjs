@@ -8,11 +8,12 @@
  */
 import fs from "fs";
 import http from "http";
+import https from "https";
 import path from "path";
 import zlib from "zlib";
 import { createRequire } from "module";
 import { fileURLToPath } from "url";
-import { createRouter } from "../lib/mesh_route.js";
+import { createRouter, p2pScheme } from "../lib/mesh_route.js";
 
 const require = createRequire(import.meta.url);
 const { Collection, Space } = require("js-indexus-sdk");
@@ -21,6 +22,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOOT = (process.env.BOOT || "127.0.0.1")
   .replace(/^https?:\/\//, "")
   .split(":")[0];
+
+function writerSeeds() {
+  const scheme = p2pScheme();
+  const bases = [`${scheme}://${BOOT}:21000`];
+  const ports = String(process.env.INDEXUS_LOAD_PORTS || "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  for (const port of ports) {
+    const base = `${scheme}://${BOOT}:${port}`;
+    if (!bases.includes(base)) bases.push(base);
+  }
+  return bases;
+}
 const TOKEN = process.env.TOKEN || "";
 const RPS = Number(process.env.RPS || "100");
 const RPS_START = Number(process.env.RPS_START || process.env.RPS || "100");
@@ -33,10 +48,24 @@ const DATA_SHARD_INDEX = Number(
   process.env.DATA_SHARD_INDEX || String(WRITER_INDEX % DATA_SHARDS)
 );
 const DATA_OFFSET = Number(process.env.DATA_OFFSET || "0");
-const COLLECTION = (process.env.COLLECTION || "SmoothPeak01").slice(0, 16);
+const COLLECTION = (process.env.COLLECTION || "SmoothPeak000001").slice(0, 16);
 const PRECISION = Number(process.env.LOC_PRECISION || "12");
 const MAX_INFLIGHT = Number(process.env.MAX_INFLIGHT || "2048");
 const RETRIES = Number(process.env.RETRIES || "2");
+const WRITE_MODE = (process.env.INDEXUS_CLIENT_WRITE_MODE || "forward").toLowerCase();
+const CLIENT_ROUTE = (process.env.INDEXUS_CLIENT_ROUTE || "xor").toLowerCase();
+const SPREAD_HOPS = CLIENT_ROUTE === "rr" || CLIENT_ROUTE === "spread";
+// XOR tables stay boot-filled + 201 hints. Spread needs a live walk or HTTP
+// stays on the bootstrap seed after PreferNear joiners appear.
+const ROUTE_REFRESH_MS = Number(
+  process.env.INDEXUS_ROUTE_REFRESH_MS || (SPREAD_HOPS ? "5000" : "0")
+);
+// 201 X-Indexus-Ingress-* stick the last owner into the hop table (PreferNear
+// magnet). INDEXUS_ADOPT_HINTS=0 keeps pick() on XOR of the discovered table.
+const ADOPT_HINTS = !["0", "false", "no"].includes(
+  String(process.env.INDEXUS_ADOPT_HINTS || "1").toLowerCase()
+);
+const RAMP_SECONDS_ENV = Number(process.env.RAMP_SECONDS || "0");
 const RUN_ID = process.env.RUN_ID || Date.now().toString(36);
 const CSV =
   process.env.DENSITY_CSV ||
@@ -63,11 +92,19 @@ const space = new Space(
   collection.mask(),
   collection.offset()
 );
-const agent = new http.Agent({
-  keepAlive: true,
-  maxSockets: MAX_INFLIGHT,
-  maxFreeSockets: MAX_INFLIGHT,
-});
+const agent =
+  p2pScheme() === "https"
+    ? new https.Agent({
+        keepAlive: true,
+        maxSockets: MAX_INFLIGHT,
+        maxFreeSockets: MAX_INFLIGHT,
+        rejectUnauthorized: false,
+      })
+    : new http.Agent({
+        keepAlive: true,
+        maxSockets: MAX_INFLIGHT,
+        maxFreeSockets: MAX_INFLIGHT,
+      });
 
 /** FNV-1a → mulberry32 seed so every writer sharing RUN_ID shuffles alike. */
 function seedFrom(runId) {
@@ -128,13 +165,17 @@ function loadPoints() {
 }
 
 const points = loadPoints();
-// High default: cycle the full shuffled pool so inserts stay density-faithful
-// without collapsing onto a tiny working set (skewed PreferNear heat).
-const CARDINALITY = Number(
-  process.env.CARDINALITY || String(Math.max(points.length, 8000))
-);
-if (!Number.isInteger(CARDINALITY) || CARDINALITY < 1) {
-  throw new Error("CARDINALITY must be a positive integer");
+const UNIQUE_WRITES =
+  process.env.UNIQUE_WRITES === "1" ||
+  process.env.UNIQUE_WRITES === "true" ||
+  process.env.UNIQUE_WRITES === "yes";
+// Cycling mode revisits a fixed working set; unique mode emits one distinct
+// (location, id) per sequence — required for 250k+ conservation benches.
+const CARDINALITY = UNIQUE_WRITES
+  ? 0
+  : Number(process.env.CARDINALITY || String(Math.max(points.length, 8000)));
+if (!UNIQUE_WRITES && (!Number.isInteger(CARDINALITY) || CARDINALITY < 1)) {
+  throw new Error("CARDINALITY must be a positive integer when UNIQUE_WRITES=0");
 }
 
 function locationFor(sequence) {
@@ -156,35 +197,47 @@ function post(base, body) {
     const url = new URL(`${base}/item`);
     const payload = JSON.stringify(body);
     const started = performance.now();
-    const req = http.request(
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Length": Buffer.byteLength(payload),
+    };
+    if (WRITE_MODE === "redirect") {
+      headers["X-Indexus-Write-Mode"] = "redirect";
+    }
+    const lib = url.protocol === "https:" ? https : http;
+    const req = lib.request(
       {
         hostname: url.hostname,
         port: url.port,
         path: url.pathname,
         method: "POST",
         agent,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TOKEN}`,
-          "Content-Length": Buffer.byteLength(payload),
-        },
+        headers,
         timeout: 5000,
+        rejectUnauthorized: false,
       },
       (res) => {
         let raw = "";
         res.on("data", (chunk) => {
-          if (raw.length < 512) raw += chunk;
+          if (raw.length < 2048) raw += chunk;
         });
         res.on("end", () => {
-          let error = "";
+          let parsed = {};
           try {
-            error = JSON.parse(raw).error || "";
+            parsed = JSON.parse(raw);
           } catch {
-            error = raw.slice(0, 120);
+            parsed = { error: raw.slice(0, 120) };
           }
           resolve({
             status: res.statusCode || 0,
-            error,
+            error: parsed.error || "",
+            redirect_name: parsed.redirect_name || "",
+            redirect_ip: parsed.redirect_ip || "",
+            redirect_port: parsed.redirect_port || 0,
+            ingress_name: res.headers["x-indexus-ingress-name"] || "",
+            ingress_ip: res.headers["x-indexus-ingress-ip"] || "",
+            ingress_port: Number(res.headers["x-indexus-ingress-port"] || 0),
             latencyMs: performance.now() - started,
           });
         });
@@ -202,10 +255,9 @@ function post(base, body) {
   });
 }
 
-const router = createRouter([`http://${BOOT}:21000`], {
+const router = createRouter(writerSeeds(), {
   token: TOKEN,
-  refreshEvery: 64,
-  refreshMs: 1000,
+  route: CLIENT_ROUTE,
 });
 
 const counters = {
@@ -227,15 +279,18 @@ function increment(map, key) {
 
 async function send(sequence) {
   inflight++;
-  // Revisit a realistic working set after seeding it. This measures sustained
-  // apply throughput without turning the test into an unbounded RAM-fill test.
-  const dataSequence = (sequence + DATA_OFFSET) % CARDINALITY;
+  const dataSequence = UNIQUE_WRITES
+    ? sequence + DATA_OFFSET
+    : (sequence + DATA_OFFSET) % CARDINALITY;
   const location = locationFor(dataSequence);
+  const itemId = UNIQUE_WRITES
+    ? `${RUN_ID}-${DATA_SHARD_INDEX}-${sequence}`
+    : `${RUN_ID}-${DATA_SHARD_INDEX}-${dataSequence}`;
   const body = {
     item: {
       collection: COLLECTION,
       location,
-      id: `${RUN_ID}-${DATA_SHARD_INDEX}-${dataSequence}`,
+      id: itemId,
       metrics: [1, 0, 0, 1, 1],
     },
     root: "@",
@@ -251,13 +306,41 @@ async function send(sequence) {
       if (result.status === 201) {
         counters.accepted++;
         latencies.push(result.latencyMs);
+        if (
+          ADOPT_HINTS &&
+          result.ingress_ip &&
+          result.ingress_name
+        ) {
+          router.adoptHint(COLLECTION, location, {
+            name: result.ingress_name,
+            ip: result.ingress_ip,
+            port: result.ingress_port,
+          });
+        }
         return;
+      }
+      if (result.status === 421 && result.redirect_ip) {
+        counters.retries++;
+        router.adoptRedirect({
+          name: result.redirect_name,
+          ip: result.redirect_ip,
+          port: result.redirect_port,
+        });
+        // The redirect is an authoritative, immediately usable owner hint.
+        // A full discovery walk here makes every concurrent wrong-route write
+        // wait on the same expensive refresh and can exhaust MAX_INFLIGHT.
+        continue;
       }
       increment(errors, result.error || `HTTP_${result.status}`);
       if (attempt === RETRIES) break;
       counters.retries++;
-      router.markHot(base, 300 + attempt * 500);
-      if (attempt > 0) await router.forceRefresh();
+      if (result.status === 0) {
+        router.dropPeer(base);
+        await router.forceRefresh();
+      } else {
+        router.markHot(base, 300 + attempt * 500);
+        if (attempt > 0) await router.forceRefresh();
+      }
       await sleep(100 + Math.random() * 100 + attempt * 200);
     }
     counters.failed++;
@@ -281,8 +364,12 @@ let nextDue = started;
 
 function targetRps(elapsedS) {
   if (RPS_END === RPS_START || DURATION_S <= 0) return RPS_END;
-  const share = Math.min(1, Math.max(0, elapsedS / DURATION_S));
-  return RPS_START + (RPS_END - RPS_START) * share;
+  const rampS =
+    RAMP_SECONDS_ENV > 0 && RAMP_SECONDS_ENV < DURATION_S
+      ? RAMP_SECONDS_ENV
+      : DURATION_S;
+  if (elapsedS >= rampS) return RPS_END;
+  return RPS_START + (RPS_END - RPS_START) * (elapsedS / rampS);
 }
 
 console.log(
@@ -298,18 +385,75 @@ console.log(
     rps_end: RPS_END,
     duration_s: DURATION_S,
     collection: COLLECTION,
-    cardinality: CARDINALITY,
+    cardinality: UNIQUE_WRITES ? null : CARDINALITY,
+    unique_writes: UNIQUE_WRITES,
     points: points.length,
     run_id: RUN_ID,
     shuffle: "fisher_yates_run_id",
+    write_mode: WRITE_MODE,
+    client_route: CLIENT_ROUTE,
+    route_refresh_ms: ROUTE_REFRESH_MS,
+    adopt_hints: ADOPT_HINTS,
+    ramp_seconds: RAMP_SECONDS_ENV || DURATION_S,
     peers: initialPeers.length,
   })
 );
 
+let lastTickAt = started;
+let lastPeerRefresh = started;
+let peerCount = initialPeers.length;
+const TICK_EVERY_MS = 2000;
+
 while (performance.now() < endAt) {
   const now = performance.now();
   const elapsedS = (now - started) / 1000;
-  const intervalMs = 1000 / Math.max(targetRps(elapsedS), 0.001);
+  const currentTarget = targetRps(elapsedS);
+  if (now - lastTickAt >= TICK_EVERY_MS) {
+    lastTickAt = now;
+    console.log(
+      JSON.stringify({
+        event: "writer_tick",
+        writer: WRITER_INDEX,
+        elapsed_s: Number(elapsedS.toFixed(2)),
+        target_rps: Number(currentTarget.toFixed(1)),
+        offered: counters.offered,
+        accepted: counters.accepted,
+        failed: counters.failed,
+        retries: counters.retries,
+        dropped: counters.dropped,
+        inflight,
+        offered_rps: Number((counters.offered / Math.max(elapsedS, 0.001)).toFixed(1)),
+        accepted_rps: Number((counters.accepted / Math.max(elapsedS, 0.001)).toFixed(1)),
+        peers: peerCount,
+      })
+    );
+    try {
+      fs.writeFileSync(
+        "/tmp/indexus-writer-progress.json",
+        JSON.stringify({
+          writer: WRITER_INDEX,
+          elapsed_s: Number(elapsedS.toFixed(2)),
+          target_rps: Number(currentTarget.toFixed(1)),
+          offered: counters.offered,
+          accepted: counters.accepted,
+          dropped: counters.dropped,
+          inflight,
+          offered_rps: Number((counters.offered / Math.max(elapsedS, 0.001)).toFixed(1)),
+          accepted_rps: Number((counters.accepted / Math.max(elapsedS, 0.001)).toFixed(1)),
+          peers: peerCount,
+        })
+      );
+    } catch {
+      // progress file is best-effort for the sampler
+    }
+  }
+  if (ROUTE_REFRESH_MS > 0 && now - lastPeerRefresh >= ROUTE_REFRESH_MS) {
+    lastPeerRefresh = now;
+    void router.forceRefresh().then(async () => {
+      peerCount = (await router.peers()).length;
+    });
+  }
+  const intervalMs = 1000 / Math.max(currentTarget, 0.001);
   if (now < nextDue) {
     await sleep(Math.min(5, nextDue - now));
     continue;
@@ -331,11 +475,8 @@ const drainDeadline = performance.now() + 15000;
 while (inflight > 0 && performance.now() < drainDeadline) await sleep(25);
 
 const elapsedS = (performance.now() - started) / 1000;
+const actualOfferedRps = counters.offered / Math.max(elapsedS, 0.001);
 const finalPeers = await router.peers();
-const avgOfferedRps =
-  RPS_END === RPS_START
-    ? RPS_END
-    : (RPS_START + RPS_END) / 2;
 agent.destroy();
 console.log(
   JSON.stringify({
@@ -343,10 +484,15 @@ console.log(
     writer: WRITER_INDEX,
     writers: WRITER_COUNT,
     elapsed_s: Number(elapsedS.toFixed(3)),
-    offered_rps: Number(avgOfferedRps.toFixed(1)),
+    offered_rps: Number(actualOfferedRps.toFixed(1)),
+    target_avg_rps: Number(
+      (RPS_END === RPS_START ? RPS_END : (RPS_START + RPS_END) / 2).toFixed(1)
+    ),
     rps_start: RPS_START,
     rps_end: RPS_END,
     accepted_rps: Number((counters.accepted / elapsedS).toFixed(1)),
+    unique_writes: UNIQUE_WRITES,
+    cardinality: UNIQUE_WRITES ? null : CARDINALITY,
     ...counters,
     peers: finalPeers.length,
     p50_ms: Number(percentile(latencies, 0.5).toFixed(2)),
