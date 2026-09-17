@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  forgetSeedPeer,
+  pruneSeedPeers,
+} from "../lib/indexus/peerStore.js";
 
 /** Hold full color after last request, then fade to transparent. */
 const HOT_MS = 1200;
@@ -40,7 +44,10 @@ function samePeerList(a, b) {
  * Aggregate / Data side panel: known client peers + live request pulse.
  *
  * @param {{
- *   controller?: { subscribeNetwork?: (fn: Function) => () => void },
+ *   controller?: {
+ *     subscribeNetwork?: (fn: Function) => () => void,
+ *     forgetPeer?: (hash: string) => boolean,
+ *   },
  *   empty?: string,
  * }} props
  */
@@ -52,11 +59,46 @@ export default function NodesList({
   const [routingKey, setRoutingKey] = useState(null);
   const [tick, setTick] = useState(0);
   const stateRef = useRef(new Map());
+  const prevHashesRef = useRef(new Set());
+
+  function onForget(row) {
+    if (!row?.hash || !controller?.forgetPeer) return;
+    // Remove the cross-session trace first; the worker's membership event can
+    // then persist the smaller table without resurrecting this contact.
+    const networkId = globalThis.__INDEXUS_NETWORK_ID__ || "";
+    forgetSeedPeer(row.hash, networkId);
+    stateRef.current.delete(row.key);
+    setPeers((previous) =>
+      previous.filter((peer) => peer.hash !== row.hash)
+    );
+    controller.forgetPeer(row.hash);
+    setTick((n) => n + 1);
+  }
 
   useEffect(() => {
     if (!controller?.subscribeNetwork) return undefined;
     return controller.subscribeNetwork((snap) => {
       const list = Array.isArray(snap?.peers) ? snap.peers : [];
+      const networkId = globalThis.__INDEXUS_NETWORK_ID__ || "";
+      const alive = new Set(
+        list.map((peer) => peer?.hash).filter(Boolean),
+      );
+
+      // Peers that left the live table (unreachable / Drain) leave the UI
+      // and the browser seed cache immediately.
+      const previous = prevHashesRef.current;
+      for (const hash of previous) {
+        if (!alive.has(hash)) forgetSeedPeer(hash, networkId);
+      }
+      pruneSeedPeers(alive, networkId);
+      prevHashesRef.current = alive;
+
+      for (const [key, row] of [...stateRef.current.entries()]) {
+        if (row.hash && !alive.has(row.hash) && (row.inFlight || 0) === 0) {
+          stateRef.current.delete(key);
+        }
+      }
+
       // Identity changes on every worker message; only re-render on real
       // membership changes or the map fights the pan for frames.
       setPeers((prev) => (samePeerList(prev, list) ? prev : list));
@@ -73,6 +115,14 @@ export default function NodesList({
 
       for (const activity of events) {
         if (!activity?.host && !activity?.hash) continue;
+        // Failed dials against peers already dropped from the table must not
+        // reappear as ghost rows.
+        if (activity.hash && alive.size > 0 && !alive.has(activity.hash)) {
+          if (activity.phase === "end" && activity.ok === false) {
+            forgetSeedPeer(activity.hash, networkId);
+          }
+          continue;
+        }
         const key =
           activity.host || `${activity.ip}|${activity.port}` || activity.hash;
         if (!key) continue;
@@ -104,6 +154,9 @@ export default function NodesList({
           row.inFlight = Math.max(0, row.inFlight - 1);
           row.lastActiveAt = at;
           row.lastOk = activity.ok !== false;
+          if (activity.ok === false && activity.hash) {
+            forgetSeedPeer(activity.hash, networkId);
+          }
         }
         touched = true;
       }
@@ -139,10 +192,12 @@ export default function NodesList({
   const rows = useMemo(() => {
     const now = performance.now();
     const byHost = new Map();
+    const aliveHosts = new Set();
 
     for (const p of peers) {
       const key = p.host || `${p.ip}|${p.port}` || p.hash;
       if (!key) continue;
+      aliveHosts.add(key);
       const live = stateRef.current.get(key);
       byHost.set(key, {
         key,
@@ -157,12 +212,15 @@ export default function NodesList({
         lastOk: live?.lastOk,
         opacity: activityOpacity(live?.lastActiveAt, now, live?.inFlight || 0),
         color: colorForKey(p.hash || key),
+        inTable: true,
       });
     }
 
-    // Activity-only peers not yet in table (race during ping).
+    // In-flight activity for a host still in the table only — never revive
+    // down peers as activity-only ghost rows.
     for (const [key, live] of stateRef.current) {
-      if (byHost.has(key)) continue;
+      if (byHost.has(key) || !aliveHosts.has(key)) continue;
+      if ((live.inFlight || 0) <= 0) continue;
       byHost.set(key, {
         key,
         hash: live.hash,
@@ -176,6 +234,7 @@ export default function NodesList({
         lastOk: live.lastOk,
         opacity: activityOpacity(live.lastActiveAt, now, live.inFlight),
         color: colorForKey(live.hash || key),
+        inTable: false,
       });
     }
 
@@ -251,6 +310,17 @@ export default function NodesList({
                     : ""}
               </div>
             </div>
+            {row.inTable && row.hash && controller?.forgetPeer ? (
+              <button
+                type="button"
+                className="node-forget"
+                onClick={() => onForget(row)}
+                title="Oublier ce nœud pour cette session"
+                aria-label={`Oublier le nœud ${row.hash}`}
+              >
+                ×
+              </button>
+            ) : null}
           </div>
         );
       })}

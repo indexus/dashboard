@@ -5,10 +5,11 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /**
- * Vendored himo.place WebGPU heatmap (src/himo). It also carries the SDK both
- * read modes go through: Aggregate via Grid/Cube, Nearby via Local.
+ * Aggregate map stack (WebGPU heatmap + grid worker).
+ * Nearby (Local) and Aggregate (Grid/Cube) share the canonical sdk-js source.
  */
-const himoSrc = path.join(__dirname, "src/himo");
+const sdkSrc = path.join(__dirname, "../sdk-js/src");
+const renderingMapSrc = path.join(__dirname, "../sdk-js-rendering/map/src");
 const nm = path.join(__dirname, "node_modules");
 
 export default defineConfig({
@@ -20,7 +21,11 @@ export default defineConfig({
       { find: "d3", replacement: path.join(nm, "d3") },
       { find: "axios", replacement: path.join(nm, "axios") },
       { find: "maplibre-gl", replacement: path.join(nm, "maplibre-gl") },
-      { find: /^@himo\/(.*)$/, replacement: path.join(himoSrc, "$1") },
+      { find: /^js-indexus-sdk$/, replacement: path.join(sdkSrc, "index.js") },
+      {
+        find: /^@indexus\/rendering-map$/,
+        replacement: path.join(renderingMapSrc, "index.js"),
+      },
     ],
     dedupe: ["maplibre-gl", "react", "react-dom", "buffer", "d3", "axios", "earcut"],
   },
@@ -38,10 +43,13 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5173,
     proxy: {
+      // Sleep/wake/create AWS wait on EC2 (up to several minutes). A 10s
+      // proxy timeout surfaces in the browser as opaque "Failed to fetch".
       "/api": {
         target: "http://127.0.0.1:3847",
         changeOrigin: true,
-        timeout: 10_000,
+        timeout: 900_000,
+        proxyTimeout: 900_000,
         configure: (proxy) => {
           proxy.on("error", (err, _req, res) => {
             console.warn("[vite] /api proxy:", err.code || err.message);
@@ -59,7 +67,11 @@ export default defineConfig({
       },
     },
     fs: {
-      allow: [__dirname],
+      allow: [
+        __dirname,
+        path.join(__dirname, "../sdk-js"),
+        path.join(__dirname, "../sdk-js-rendering"),
+      ],
     },
   },
   build: {

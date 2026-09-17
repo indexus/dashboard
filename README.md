@@ -3,7 +3,7 @@
 Vite + React ops console with map data access. Bound to **127.0.0.1**.
 
 - **Ops:** monitoring (`:19000`) + issuer scale/snapshots (`:22000`)
-- **Data:** MapLibre + `js-indexus-sdk` over mesh P2P hosts from `/api/mesh`
+- **Data:** MapLibre + `@indexus/rendering-map`, backed by the canonical `js-indexus-sdk`, over mesh P2P hosts from `/api/mesh`
 
 Expects a local mesh from `core/scripts/local/mesh_up.sh`, or set `BOOT_IP` / `ISSUER_URL` for AWS.
 
@@ -29,11 +29,22 @@ pnpm build && BOOT_IP=127.0.0.1 pnpm start
 # World population density sample
 pnpm load-density:sample
 
-# DVF purchases (CSV dir via DVF_DATA_DIR, default portfolio/himo loaders)
+# DVF purchases (CSV dir via DVF_DATA_DIR; default looks for a sibling portfolio CSV tree)
 pnpm load-dvf:sample
 # Full year (XOR-route to discovered peers):
 node scripts/load_dvf.js --year 2020 --ports 21000 --route xor
 ```
+
+## Layout
+
+| Path | Role |
+|------|------|
+| `../sdk-js/src/` | Canonical SDK source used by browser, worker and Node loaders |
+| `../sdk-js-rendering/map/` | Aggregate rendering (WebGPU, worker, WASM) |
+| `src/lib/indexus/` | Dashboard network/collection helpers |
+| `src/components/` | React UI (Ops + Data) |
+
+Import rendering code through the public `@indexus/rendering-map` entry point.
 
 ## Env
 
@@ -45,10 +56,10 @@ node scripts/load_dvf.js --year 2020 --ports 21000 --route xor
 | `P2P_PORT` | `21000` | Peer port for sdk |
 | `PORT` | `3847` | Dash API / static |
 | `INDEXUS_CORE_ROOT` | `../core` | Local spawn metadata + `terminate.sh` |
-| `DVF_DATA_DIR` | portfolio himo output | DVF CSV directory |
+| `DVF_DATA_DIR` | sibling portfolio CSV output | DVF CSV directory |
 | `DENSITY_CSV` | `data/world_density_100k.csv` | Density points |
 
 ## Notes
 
 - Force kill (`POST /api/terminate`) runs `core/scripts/local/terminate.sh` and clears sticky `local-N` certs.
-- Collection presets: `FrGeoBenchAws00001`, himo `DENjYsMTAyLDE2ME`, DVF purchases `DvFMV2020idx0001`.
+- Collection presets: `FrGeoBenchAws00001`, legacy geo `DENjYsMTAyLDE2ME`, DVF purchases `DvFMV2020idx0001`.

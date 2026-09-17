@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 const fmtSize = (n) => {
   if (n == null || Number.isNaN(n)) return "—";
@@ -89,10 +89,19 @@ function pathLabel(seg, i, path) {
 }
 
 /**
- * @param {{ objects?: object[], available?: boolean, error?: string }} props
+ * @param {{
+ *   objects?: object[],
+ *   available?: boolean,
+ *   error?: string,
+ *   onPathChange?: (prefix: string) => void,
+ * }} props
  */
-export default function SnapshotsBrowser({ objects = [] }) {
+export default function SnapshotsBrowser({ objects = [], onPathChange }) {
   const [path, setPath] = useState(/** @type {string[]} */ ([]));
+
+  useEffect(() => {
+    onPathChange?.(path.join("/"));
+  }, [onPathChange, path]);
 
   const objs = useMemo(
     () => (objects || []).map(normalizeObj).filter((o) => o.key),

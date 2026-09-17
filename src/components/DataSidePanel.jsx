@@ -4,7 +4,7 @@ import { useOverlayScroll } from "../lib/overlayScroll.js";
 
 /**
  * Right-hand Data panel: Contrôles ↔ Items ↔ Nodes ↔ Metrics
- * for both Nearby and Aggregate.
+ * for both Nearby and Aggregate. Collapsible rail on the right of the map.
  */
 export default function DataSidePanel({
   view,
@@ -21,10 +21,13 @@ export default function DataSidePanel({
   itemsLabel = "Items",
   nodesLabel = "Nodes",
   metricsLabel = "Metrics",
+  collapsed = false,
+  onToggleCollapsed,
 }) {
-  const bodyRef = useOverlayScroll([view]);
+  const bodyRef = useOverlayScroll([view, collapsed]);
   const showNodes = nodes != null;
   const showMetrics = metrics != null;
+  const showAddFoot = view === "items" && !!onAddClick;
 
   let body = items;
   if (view === "controls") body = controls;
@@ -32,74 +35,102 @@ export default function DataSidePanel({
   else if (view === "metrics" && showMetrics) body = metrics;
 
   return (
-    <aside className="data-side" aria-label="data side panel">
+    <aside
+      className={`data-side${collapsed ? " is-collapsed" : ""}`}
+      aria-label="data side panel"
+      aria-expanded={!collapsed}
+    >
       <div className="data-side-head">
-        <div className="data-side-tabs" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === "controls"}
-            className={view === "controls" ? "active" : ""}
-            onClick={() => onView("controls")}
-          >
-            {controlsLabel}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === "items"}
-            className={view === "items" ? "active" : ""}
-            onClick={() => onView("items")}
-          >
-            {itemsLabel}
-            {itemCount > 0 ? (
-              <span className="data-side-count">{itemCount}</span>
-            ) : null}
-          </button>
-          {showNodes ? (
+        {!collapsed ? (
+          <div className="data-side-tabs" role="tablist">
             <button
               type="button"
               role="tab"
-              aria-selected={view === "nodes"}
-              className={view === "nodes" ? "active" : ""}
-              onClick={() => onView("nodes")}
+              aria-selected={view === "controls"}
+              className={view === "controls" ? "active" : ""}
+              onClick={() => onView("controls")}
             >
-              {nodesLabel}
-              {nodeCount > 0 ? (
-                <span className="data-side-count">{nodeCount}</span>
+              {controlsLabel}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === "items"}
+              className={view === "items" ? "active" : ""}
+              onClick={() => onView("items")}
+            >
+              {itemsLabel}
+              {itemCount > 0 ? (
+                <span className="data-side-count">{itemCount}</span>
               ) : null}
             </button>
-          ) : null}
-          {showMetrics ? (
+            {showNodes ? (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === "nodes"}
+                className={view === "nodes" ? "active" : ""}
+                onClick={() => onView("nodes")}
+              >
+                {nodesLabel}
+                {nodeCount > 0 ? (
+                  <span className="data-side-count">{nodeCount}</span>
+                ) : null}
+              </button>
+            ) : null}
+            {showMetrics ? (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === "metrics"}
+                className={view === "metrics" ? "active" : ""}
+                onClick={() => onView("metrics")}
+              >
+                {metricsLabel}
+                {metricsHint != null && metricsHint !== "" ? (
+                  <span className="data-side-count">{metricsHint}</span>
+                ) : null}
+              </button>
+            ) : null}
+          </div>
+        ) : (
+          <span className="sr-only">Panel collapsed</span>
+        )}
+        <div className="data-side-head-actions">
+          {onToggleCollapsed ? (
             <button
               type="button"
-              role="tab"
-              aria-selected={view === "metrics"}
-              className={view === "metrics" ? "active" : ""}
-              onClick={() => onView("metrics")}
+              className="icon-btn data-side-toggle"
+              title={collapsed ? "Expand panel" : "Collapse panel"}
+              aria-label={collapsed ? "Expand panel" : "Collapse panel"}
+              aria-expanded={!collapsed}
+              onClick={onToggleCollapsed}
             >
-              {metricsLabel}
-              {metricsHint != null && metricsHint !== "" ? (
-                <span className="data-side-count">{metricsHint}</span>
-              ) : null}
+              {collapsed ? "‹" : "›"}
             </button>
           ) : null}
         </div>
-        {onAddClick ? (
-          <button
-            type="button"
-            className="icon-btn"
-            title="Add item"
-            aria-label="Add item"
-            onClick={onAddClick}
-          >
-            +
-          </button>
-        ) : null}
       </div>
-      <div className="data-side-body scroll-fade" ref={bodyRef}>
-        {body}
-      </div>
+      {!collapsed ? (
+        <div
+          className={`data-side-body${showAddFoot ? " data-side-body--items" : ""}`}
+        >
+          <div className="data-side-body-scroll scroll-fade" ref={bodyRef}>
+            {body}
+          </div>
+          {showAddFoot ? (
+            <div className="data-side-items-foot">
+              <button
+                type="button"
+                className="primary compact data-side-add"
+                onClick={onAddClick}
+              >
+                + Add item
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </aside>
   );
 }
@@ -197,7 +228,8 @@ export function HitsList({
     const el = sentinelRef.current;
     if (!el || !onLoadMore || !hasMore) return undefined;
 
-    const root = el.closest(".data-side-body");
+    const root =
+      el.closest(".data-side-body-scroll") || el.closest(".data-side-body");
     let cancelled = false;
 
     const io = new IntersectionObserver(
@@ -290,6 +322,11 @@ export function NearbyControls({
   onNext,
   canNext,
   busy,
+  readNavigation,
+  onReadNavigation,
+  readMethod,
+  onReadMethod,
+  onClearCache,
 }) {
   return (
     <section className="data-rail-section">
@@ -304,6 +341,45 @@ export function NearbyControls({
           <span>hint</span> clic carte pour déplacer l’origine
         </div>
       </div>
+      {onReadNavigation && onReadMethod ? (
+        <div className="data-ctrl-read-block">
+          <div className="data-ctrl-row data-ctrl-read">
+            <label className="field">
+              navigation
+              <select
+                value={readNavigation}
+                onChange={(e) => onReadNavigation(e.target.value)}
+                title="ingress : nœud d’entrée session · direct : redirects XOR"
+              >
+                <option value="direct">direct</option>
+                <option value="ingress">ingress</option>
+              </select>
+            </label>
+            <label className="field">
+              méthode
+              <select
+                value={readMethod}
+                onChange={(e) => onReadMethod(e.target.value)}
+                title="getSets : batch · getSet : une zone par requête"
+              >
+                <option value="getSets">getSets</option>
+                <option value="getSet">getSet</option>
+              </select>
+            </label>
+          </div>
+          {onClearCache ? (
+            <button
+              type="button"
+              className="ghost compact"
+              disabled={busy}
+              onClick={onClearCache}
+              title="Wipe client /sets cache and owner pins, then re-fetch over the network (no remount)"
+            >
+              Clear cache
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <label className="data-ctrl-slider">
         <span className="data-ctrl-label">
           Normalizer €/m² <em>{normalizer}</em>

@@ -4,10 +4,7 @@
  */
 import axios from "axios";
 
-import { API } from "../src/himo/js-indexus-sdk/api/index.js";
-import { Network } from "../src/himo/js-indexus-sdk/network/index.js";
-import { ROOT } from "../src/himo/js-indexus-sdk/utilities/encoding.js";
-import { abelianTotal } from "../src/himo/js-indexus-sdk/entities/abelian.js";
+import { API, Network, ROOT, abelianTotal } from "js-indexus-sdk";
 
 const DASH = process.env.DASH_URL || "http://127.0.0.1:3847";
 const COLLECTION = process.env.COLLECTION || "DvFMV2020idx0001";

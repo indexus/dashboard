@@ -1,113 +1,94 @@
-import { COLLECTION_PRESETS, VIEW_MODES } from "../lib/sdk.js";
+import { COLLECTION_PRESETS } from "../lib/sdk.js";
+import ResourceDropdown from "./ResourceDropdown.jsx";
 
 /**
- * Topbar nav cluster: Ops/Data (+ Data submenu: Nearby/Aggregate, collection…).
- * Rendered inline inside Header on the same row as brand / theme / LIVE.
+ * Topbar nav cluster: Network/Client switch (+ Client: collection, refresh…).
+ * Mode Aggregate/Nearby lives on the map badge; read knobs live in Contrôles.
  */
 export default function CollectionBar({
   tab,
   onTab,
+  networks = [],
+  activeNetworkId,
+  onNetwork,
+  onCreateNetwork,
+  onDeleteNetwork,
+  collections = [],
   collection,
   onCollection,
-  mode,
-  onMode,
-  readNavigation,
-  onReadNavigation,
-  readMethod,
-  onReadMethod,
+  onCreateCollection,
+  onDeleteCollection,
   peerHint,
   onReset,
   busy,
 }) {
-  const data = tab === "data";
+  const client = tab === "client";
+  const next = client ? "network" : "client";
+  const currentLabel = client ? "Client" : "Network";
+  const networkItems = networks.map((network) => ({
+    ...network,
+    label: network.label || network.id,
+    meta: `${network.state}${Number.isFinite(network.nodes) ? ` · ${network.nodes} nodes` : ""}`,
+  }));
+  const collectionItems = [
+    ...new Map(
+      [
+        ...COLLECTION_PRESETS,
+        ...collections.map((id) => ({ id, label: id })),
+      ].map((item) => [item.id, item]),
+    ).values(),
+  ];
 
   return (
     <div className="topbar-nav">
-      <nav className="seg" role="tablist" aria-label="sections">
-        <button
-          type="button"
-          role="tab"
-          className={tab === "ops" ? "seg-active" : ""}
-          aria-selected={tab === "ops"}
-          onClick={() => onTab?.("ops")}
-        >
-          Ops
-        </button>
-        <button
-          type="button"
-          role="tab"
-          className={tab === "data" ? "seg-active" : ""}
-          aria-selected={tab === "data"}
-          onClick={() => onTab?.("data")}
-        >
-          Data
-        </button>
-      </nav>
+      <button
+        type="button"
+        className="section-switch"
+        onClick={() => onTab?.(next)}
+        title={`Switch to ${next === "client" ? "Client" : "Network"}`}
+        aria-label={`Section ${currentLabel}. Click to switch to ${
+          next === "client" ? "Client" : "Network"
+        }.`}
+      >
+        {currentLabel}
+      </button>
 
-      {data ? (
+      <span className="topbar-sep" aria-hidden="true" />
+
+      {networkItems.length === 0 ? (
+        <button
+          type="button"
+          className="primary compact resource-add-network"
+          disabled={busy || !onCreateNetwork}
+          onClick={onCreateNetwork}
+        >
+          + Add network
+        </button>
+      ) : (
+        <ResourceDropdown
+          compact
+          label="Network"
+          items={networkItems}
+          value={activeNetworkId}
+          onSelect={onNetwork}
+          onCreate={onCreateNetwork}
+          onDelete={onDeleteNetwork}
+          disabled={busy}
+        />
+      )}
+
+      {client ? (
         <>
-          <span className="topbar-sep" aria-hidden="true" />
-
-          <label className="data-toolbar-field">
-            <span className="sr-only">view mode</span>
-            <select
-              value={mode}
-              onChange={(e) => onMode(e.target.value)}
-              aria-label="View mode"
-              title="Nearby or Aggregate"
-            >
-              {VIEW_MODES.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="data-toolbar-field">
-            <span className="sr-only">collection</span>
-            <input
-              list="mesh-dash-collections"
-              value={collection}
-              onChange={(e) => onCollection(e.target.value)}
-              spellCheck={false}
-              placeholder="collection"
-              title={collection}
-            />
-            <datalist id="mesh-dash-collections">
-              {COLLECTION_PRESETS.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </datalist>
-          </label>
-
-          <label className="data-toolbar-field tight">
-            <span className="sr-only">read navigation</span>
-            <select
-              value={readNavigation}
-              onChange={(e) => onReadNavigation?.(e.target.value)}
-              aria-label="Read navigation"
-              title="direct: the client follows zone owners with deep=false redirects. ingress: one sticky peer near the session key deep-fills server-side. Shared by Nearby and Aggregate."
-            >
-              <option value="direct">direct</option>
-              <option value="ingress">ingress</option>
-            </select>
-          </label>
-
-          <label className="data-toolbar-field tight">
-            <span className="sr-only">read granularity</span>
-            <select
-              value={readMethod}
-              onChange={(e) => onReadMethod?.(e.target.value)}
-              aria-label="Read granularity"
-              title="getSets: many parents coalesced into shared batches. getSet: one location per request. Both speak the same /sets protocol."
-            >
-              <option value="getSets">getSets</option>
-              <option value="getSet">getSet</option>
-            </select>
-          </label>
+          <ResourceDropdown
+            compact
+            label="Collection"
+            items={collectionItems}
+            value={collection}
+            onSelect={onCollection}
+            onCreate={onCreateCollection}
+            onDelete={onDeleteCollection}
+            disabled={busy}
+          />
 
           {onReset ? (
             <button
@@ -115,7 +96,7 @@ export default function CollectionBar({
               className="ghost compact"
               disabled={busy}
               onClick={onReset}
-              title="Refresh peers and remount Aggregate / Nearby"
+              title="Clear saved peers, refresh mesh hosts, remount Aggregate / Nearby"
             >
               Refresh
             </button>

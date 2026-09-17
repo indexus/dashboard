@@ -3,11 +3,11 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 /**
- * Aggregate heatmap — MapLibre + WebGPU (himo AverageGridLayerWebGPU).
+ * Aggregate heatmap — MapLibre + WebGPU (AverageGridLayerWebGPU).
  * Discrete point overlay when viewport item count ≤ maxPoints.
  * Theme (dark/white) comes from the app — basemap + prix/m² ramp follow it.
  */
-import { useGridWorker } from "@himo/hooks/useGridWorker.js";
+import { useGridWorker } from "@indexus/rendering-map";
 import {
   AREA_MODE_DISK,
   CELL_POSITION_MODE_BOUNDS,
@@ -18,9 +18,9 @@ import {
   HEATMAP_COLOR_SCALE_DARK,
   HEATMAP_COLOR_SCALE_WHITE,
   normalizeCellPositionConfig,
-} from "@himo/lib/heatmap.js";
-import AverageGridLayerWebGPU from "@himo/visualization/AverageGridLayerWebGPU.js";
-import { detectWebGPU } from "@himo/visualization/webgpu/detect.js";
+} from "@indexus/rendering-map";
+import { AverageGridLayerWebGPU } from "@indexus/rendering-map";
+import { detectWebGPU } from "@indexus/rendering-map";
 import {
   blackenBackdropSettlementLabels,
   brightenDatavizDarkAdminLabels,
@@ -34,21 +34,24 @@ import {
   lightenDatavizDarkRoads,
   tuneDatavizDarkBackgroundAndWater,
   whitenBackdropRoadLabels,
-} from "@himo/components/mapStyle.js";
+} from "@indexus/rendering-map";
 
 import { DETAIL_LIMIT } from "../lib/sdk.js";
-import { GPS_DIM } from "../himo/lib/indexus/collection.js";
-import { buildNetworkConfig } from "../himo/lib/indexus/networkFactory.js";
+import { GPS_DIM } from "../lib/indexus/collection.js";
+import { bootLog } from "../lib/bootLog.js";
+import { buildNetworkConfig } from "../lib/indexus/networkFactory.js";
+import { saveSeedPeers } from "../lib/indexus/peerStore.js";
 import {
   DEFAULT_READ_OPTIONS,
   MESH_DISCOVERY_INTERVAL_MS,
-} from "../himo/lib/indexus/readDefaults.js";
+} from "../lib/indexus/readDefaults.js";
 import {
   POINT_LAYER_ID,
   applyPointOverlay,
   ensurePointLayer,
 } from "../lib/pointOverlay.js";
 import DataMapControls from "./DataMapControls.jsx";
+import MapModeSwitch from "./MapModeSwitch.jsx";
 import DataSidePanel, {
   HitsList,
   hitDetailLines,
@@ -112,7 +115,7 @@ const HEATMAP_INSERT_BEFORE = [
   "country-label",
 ];
 
-const DVF_NORMALIZER = COLLECTION_DEFAULTS.normalizer; // 10000 €/m² (himo)
+const DVF_NORMALIZER = COLLECTION_DEFAULTS.normalizer; // 10000 €/m²
 
 const HEATMAP_VISUAL = { ...DEFAULT_HEATMAP_VISUAL };
 
@@ -136,7 +139,7 @@ const GRID_OPT = {
   stream: { progressive: true },
   // Chunks go out in parallel (see prefetchCollectionSpatialChunks); keep each
   // request modest so XOR-wrong batches do not redirect hundreds of locations.
-  // himo.place: serial viewport-ranked prefetch chunks of 40.
+  // Aggregate: serial viewport-ranked prefetch chunks of 40.
   network: { spatialPrefetchChunkSize: 40 },
   // Wire/cache spam: leave off. Use `"sets,refresh,reconcile"` to trace reads.
   // DEBUG_LOG posts to the main thread — leave false while interacting.
@@ -243,7 +246,7 @@ function loadCountryPolygon(layer, onPolygonLoaded) {
     .catch((error) => console.error("[AggregateHeatmap] mask:", error));
 }
 
-function HimoHeatmapMap({
+function HeatmapMap({
   mapZoom,
   mapCenter,
   averageGridController,
@@ -503,8 +506,21 @@ export default function AggregateHeatmap({
   onAddClick,
   sideView = "controls",
   onSideView,
+  sideCollapsed = false,
+  onToggleSideCollapsed,
   onViewportChange,
   readOptions = null,
+  /** Optional ref populated with `{ clearSetsCache }` for the Data toolbar. */
+  cacheApiRef = null,
+  onMode,
+  readNavigation,
+  onReadNavigation,
+  readMethod,
+  onReadMethod,
+  onClearCache,
+  busy = false,
+  /** Exclusive Aggregate | Nearby surface for the shared mesh worker. */
+  surface = "aggregate",
 }) {
   const mapStyleMode = theme === "white" ? "white" : "dark";
   const [instances, setInstances] = useState(0);
@@ -548,6 +564,8 @@ export default function AggregateHeatmap({
   );
   const [polygonFilter, setPolygonFilter] = useState(false);
   const [visualPolygonFilter, setVisualPolygonFilter] = useState(true);
+  /** Opt-in mesh auto-refresh (delta/reconcile). Off by default. */
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const mapWrapRef = useRef(null);
 
   const dynamicCenter = cellPosition.mode === CELL_POSITION_MODE_METRICS;
@@ -581,9 +599,10 @@ export default function AggregateHeatmap({
     () =>
       buildNetworkConfig({
         peers: bearer ? peers : [],
-        // himo.place Aggregate network sizing.
+        // Large enough that a France-scale drill does not LRU-evict warm zones
+        // (empty refresh answers are also refused over non-empty — see Network).
         concurrency: 100,
-        cacheSize: 50000,
+        cacheSize: 200000,
         readOptions: readOptions ?? DEFAULT_READ_OPTIONS,
         meshDiscoveryIntervalMs: MESH_DISCOVERY_INTERVAL_MS,
       }),
@@ -613,7 +632,7 @@ export default function AggregateHeatmap({
     [],
   );
 
-  const { controller, handleMapMove, registerRepaint, onPolygonLoaded } =
+  const { controller, handleMapMove, registerRepaint, onPolygonLoaded, clearSetsCache, searchNearby, setSurface } =
     useGridWorker({
       collection: collectionDef,
       gridOpt: GRID_OPT,
@@ -628,7 +647,25 @@ export default function AggregateHeatmap({
       polygonFilterEnabled: false,
       valueMetricIndex: COLLECTION_DEFAULTS.valueMetricIndex,
       childVirtualizationEnabled: COLLECTION_DEFAULTS.childVirtualizationEnabled,
+      onPeersChanged: (peers) =>
+        saveSeedPeers(peers, globalThis.__INDEXUS_NETWORK_ID__ || ""),
+      surface: surface === "nearby" ? "nearby" : "aggregate",
+      autoDelta: autoRefresh,
     });
+
+  useEffect(() => {
+    if (!cacheApiRef) return undefined;
+    cacheApiRef.current = {
+      clearSetsCache: (opts) => clearSetsCache?.(opts),
+      searchNearby: (opts) => searchNearby?.(opts),
+      setSurface: (next) => setSurface?.(next),
+      subscribeNetwork: controller?.subscribeNetwork,
+      forgetPeer: controller?.forgetPeer,
+    };
+    return () => {
+      if (cacheApiRef.current) cacheApiRef.current = null;
+    };
+  }, [cacheApiRef, clearSetsCache, searchNearby, setSurface, controller]);
 
   const onViewportChangeRef = useRef(onViewportChange);
   onViewportChangeRef.current = onViewportChange;
@@ -880,62 +917,25 @@ export default function AggregateHeatmap({
     [pointHits, onSideView, onStatus],
   );
 
-  if (!peers.length || !bearer) {
-    return (
-      <div className="agg-shell">
-        <div className="map-wrap">
-          <div className="map-mode-badge">aggregate · waiting</div>
-          <div
-            className="map-el"
-            style={{
-              display: "grid",
-              placeItems: "center",
-              color: "var(--fog)",
-              padding: "1rem",
-            }}
-          >
-            {!peers.length
-              ? "waiting for mesh hosts…"
-              : "issuing bearer for heatmap worker…"}
-          </div>
-        </div>
-        <DataSidePanel
-          view={sideView}
-          onView={onSideView || (() => {})}
-          onAddClick={onAddClick}
-          itemCount={0}
-          nodeCount={0}
-          controls={
-            <div className="hit meta" style={{ color: "var(--fog)" }}>
-              en attente du mesh…
-            </div>
-          }
-          items={
-            <div className="hit meta" style={{ color: "var(--fog)" }}>
-              pas encore de points
-            </div>
-          }
-          nodes={
-            <div className="hit meta" style={{ color: "var(--fog)" }}>
-              en attente des peers…
-            </div>
-          }
-          metrics={
-            <div className="hit meta" style={{ color: "var(--fog)" }}>
-              en attente du client…
-            </div>
-          }
-        />
-      </div>
-    );
-  }
-
+  const waiting = !peers.length || !bearer;
+  useEffect(() => {
+    bootLog(waiting ? "aggregate.waiting" : "aggregate.ready", {
+      peers: peers.length,
+      hasBearer: Boolean(bearer),
+      reason: !peers.length
+        ? "no-hosts"
+        : !bearer
+          ? "no-bearer"
+          : "ok",
+    });
+  }, [waiting, peers.length, bearer]);
   const itemsBadge =
     parentItemTotal > 0
       ? parentItemTotal.toLocaleString("fr-FR")
       : "0";
-  const badge =
-    overlayMode === "points"
+  const badgeDetail = waiting
+    ? "waiting"
+    : overlayMode === "points"
       ? `points · ${pointCount} · ${itemsBadge} items`
       : metricMode === "dvf" && dvf?.avgEuroM2 != null
         ? `heatmap · ${formatEuroM2(dvf.avgEuroM2)} · ${itemsBadge} items`
@@ -966,31 +966,46 @@ export default function AggregateHeatmap({
         onPolygonFilter={setPolygonFilter}
         visualPolygonFilter={visualPolygonFilter}
         onVisualPolygonFilter={setVisualPolygonFilter}
-        metrics={metrics}
+        metrics={waiting ? null : metrics}
+        readNavigation={readNavigation}
+        onReadNavigation={onReadNavigation}
+        readMethod={readMethod}
+        onReadMethod={onReadMethod}
+        onClearCache={onClearCache}
+        autoRefresh={autoRefresh}
+        onAutoRefresh={setAutoRefresh}
+        busy={busy}
       />
     </>
   );
 
-  const itemsPanel =
-    overlayMode === "points" ? (
-      <HitsList
-        hits={pointHits}
-        selected={selectedPoint}
-        onFocus={onPointSelect}
-        empty="aucun point dans le viewport"
-      />
-    ) : (
-      <div className="hit meta" style={{ color: "var(--fog)" }}>
-        heatmap actif · zoomez ou baissez le seuil items ({maxPoints}) pour la
-        liste des items
-      </div>
-    );
+  const itemsPanel = waiting ? (
+    <div className="hit meta" style={{ color: "var(--fog)" }}>
+      pas encore de points
+    </div>
+  ) : overlayMode === "points" ? (
+    <HitsList
+      hits={pointHits}
+      selected={selectedPoint}
+      onFocus={onPointSelect}
+      empty="aucun point dans le viewport"
+    />
+  ) : (
+    <div className="hit meta" style={{ color: "var(--fog)" }}>
+      heatmap actif · zoomez ou baissez le seuil items ({maxPoints}) pour la
+      liste des items
+    </div>
+  );
 
   return (
     <div className="agg-shell">
       <div ref={mapWrapRef} className={`map-wrap map-wrap--${mapStyleMode}`}>
         <div className="map-mode-bar">
-          <div className="map-mode-badge">{badge}</div>
+          <MapModeSwitch
+            mode="aggregate"
+            onMode={onMode}
+            detail={badgeDetail}
+          />
         </div>
         <div
           className="heatmap-legend"
@@ -1008,7 +1023,7 @@ export default function AggregateHeatmap({
             €/m²
           </span>
         </div>
-        <HimoHeatmapMap
+        <HeatmapMap
           mapZoom={zoom}
           mapCenter={center}
           averageGridController={controller}
@@ -1020,18 +1035,45 @@ export default function AggregateHeatmap({
           onPolygonLoaded={onPolygonLoaded}
           onPointClick={onPointSelect}
         />
+        {waiting ? (
+          <div className="map-waiting-msg">
+            {!peers.length
+              ? "waiting for mesh hosts…"
+              : "issuing bearer for heatmap worker…"}
+          </div>
+        ) : null}
       </div>
       <DataSidePanel
         view={sideView}
         onView={onSideView || (() => {})}
+        collapsed={sideCollapsed}
+        onToggleCollapsed={onToggleSideCollapsed}
         onAddClick={onAddClick}
-        itemCount={overlayMode === "points" ? pointHits.length : 0}
-        nodeCount={nodeCount}
-        metricsHint={metricsHint}
+        itemCount={
+          waiting ? 0 : overlayMode === "points" ? pointHits.length : 0
+        }
+        nodeCount={waiting ? 0 : nodeCount}
+        metricsHint={waiting ? null : metricsHint}
         controls={controls}
         items={itemsPanel}
-        nodes={<NodesList controller={controller} />}
-        metrics={<ClientMetrics controller={controller} />}
+        nodes={
+          waiting ? (
+            <div className="hit meta" style={{ color: "var(--fog)" }}>
+              en attente des peers…
+            </div>
+          ) : (
+            <NodesList controller={controller} />
+          )
+        }
+        metrics={
+          waiting ? (
+            <div className="hit meta" style={{ color: "var(--fog)" }}>
+              en attente du client…
+            </div>
+          ) : (
+            <ClientMetrics controller={controller} />
+          )
+        }
       />
     </div>
   );

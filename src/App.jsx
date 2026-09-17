@@ -10,8 +10,23 @@ import DataSidePanel, {
 } from "./components/DataSidePanel.jsx";
 import NodesList from "./components/NodesList.jsx";
 import ClientMetrics from "./components/ClientMetrics.jsx";
-import { getHealth, getMesh } from "./lib/api.js";
-import { attachNetworkController } from "./lib/networkController.js";
+import {
+  CollectionCreateModal,
+  NetworkCreateModal,
+} from "./components/ResourceModals.jsx";
+import {
+  createCollection,
+  createNetwork,
+  deleteCollection,
+  getCollections,
+  getHealth,
+  getMesh,
+  getNetworks,
+  networkLifecycle,
+  selectNetwork,
+} from "./lib/api.js";
+import { bootLog } from "./lib/bootLog.js";
+import { clearSeedPeers } from "./lib/indexus/peerStore.js";
 import {
   addGeoItem,
   bootstrapHost,
@@ -21,6 +36,7 @@ import {
   ensureToken,
   formatDistanceKm,
   hostsFromMesh,
+  resetToken,
   SearchSession,
 } from "./lib/sdk.js";
 
@@ -41,15 +57,19 @@ function readStoredTheme() {
 }
 
 export default function App() {
-  const [tab, setTab] = useState("ops");
+  const [tab, setTab] = useState("network");
   const [mesh, setMesh] = useState(null);
   const [health, setHealth] = useState(null);
+  const [networks, setNetworks] = useState([]);
+  const [activeNetworkId, setActiveNetworkId] = useState("");
+  const [collections, setCollections] = useState([]);
   const [pollErr, setPollErr] = useState(null);
   const [theme, setTheme] = useState(readStoredTheme);
 
   const [collection, setCollection] = useState(COLLECTION_PRESETS[0].id);
   const [mode, setMode] = useState("aggregate");
   const [sideView, setSideView] = useState("controls");
+  const [sideCollapsed, setSideCollapsed] = useState(false);
   // Off by default — auto Nearby re-queries pollute network/metrics vs Aggregate.
   const [auto, setAuto] = useState(false);
   const [step, setStep] = useState(10);
@@ -75,6 +95,11 @@ export default function App() {
   const [canNext, setCanNext] = useState(false);
   const [bearer, setBearer] = useState(() => globalThis.__INDEXUS_BEARER__ || "");
   const [addOpen, setAddOpen] = useState(false);
+  const [networkCreateOpen, setNetworkCreateOpen] = useState(false);
+  const [collectionCreateOpen, setCollectionCreateOpen] = useState(false);
+  const [resourceBusy, setResourceBusy] = useState(false);
+  const [resourceError, setResourceError] = useState("");
+  const [networkActionBusy, setNetworkActionBusy] = useState(false);
   /** Frozen peer list for Data — mesh polls must not remount Aggregate/Nearby. */
   const [dataHosts, setDataHosts] = useState([]);
   const [dataEpoch, setDataEpoch] = useState(0);
@@ -97,6 +122,31 @@ export default function App() {
     aggregate: { center: [2.3522, 48.8566], zoom: 6 },
     nearby: { center: [2.3522, 48.8566], zoom: 11 },
   });
+  /** Aggregate worker API for Clear cache (no remount). */
+  const aggregateCacheApiRef = useRef(null);
+  const activeNetworkRef = useRef("");
+
+  const adoptNetworkClient = useCallback((networkId) => {
+    if (!networkId || activeNetworkRef.current === networkId) return;
+    const previous = activeNetworkRef.current;
+    if (previous) clearSeedPeers(previous);
+    activeNetworkRef.current = networkId;
+    setActiveNetworkId(networkId);
+    resetToken(networkId);
+    dataHostsReady.current = false;
+    dataHostsRef.current = [];
+    setDataHosts([]);
+    sessionRef.current = null;
+    cumulativeRef.current = [];
+    setHits([]);
+    setAllHits([]);
+    setCanNext(false);
+    setSelectedCell(null);
+    nearbyNetDisposeRef.current?.();
+    nearbyNetDisposeRef.current = null;
+    setNearbyController(null);
+    setDataEpoch((epoch) => epoch + 1);
+  }, []);
 
   const boot = health?.boot || mesh?.boot || null;
   const bootHost = useMemo(
@@ -112,10 +162,15 @@ export default function App() {
 
   const tick = useCallback(async () => {
     try {
-      const [m, h] = await Promise.all([
+      const [m, h, registry, collectionList] = await Promise.all([
         getMesh(),
         getHealth().catch(() => null),
+        getNetworks(),
+        getCollections().catch(() => ({ collections: [] })),
       ]);
+      if (registry?.active) adoptNetworkClient(registry.active);
+      setNetworks(registry?.networks || []);
+      setCollections(collectionList?.collections || []);
       setMesh(m);
       if (h) setHealth(h);
       setPollErr(m?.error || null);
@@ -131,26 +186,49 @@ export default function App() {
         dataHostsReady.current = true;
         dataHostsRef.current = nextHosts;
         setDataHosts(nextHosts);
+        bootLog("dataHosts.freeze", {
+          count: nextHosts.length,
+          hosts: nextHosts,
+          answering: m?.totals?.answering ?? null,
+        });
       } else if (dataHostsReady.current && nextHosts.length) {
-        // Remesh / restart: frozen peers no longer exist — adopt live set.
         const live = new Set(nextHosts);
-        const stale = dataHostsRef.current.every((h) => !live.has(h));
-        if (stale) {
+        const frozen = dataHostsRef.current;
+        // Remesh / restart: every frozen host is gone — hard remount.
+        const stale = frozen.length > 0 && frozen.every((h) => !live.has(h));
+        // First mesh poll often only has bootstrap; later polls grow. Adopt
+        // the richer set so Aggregate/Nearby bootstrap from a full table
+        // (discovery alone is not enough when the first drill soft-missed).
+        const grew = nextHosts.some((h) => !frozen.includes(h));
+        if (stale || grew) {
+          bootLog(stale ? "dataHosts.stale-remount" : "dataHosts.grow", {
+            from: frozen.length,
+            to: nextHosts.length,
+            added: nextHosts.filter((h) => !frozen.includes(h)),
+            hosts: nextHosts,
+          });
           dataHostsRef.current = nextHosts;
           setDataHosts(nextHosts);
           sessionRef.current = null;
+          if (stale) setDataEpoch((epoch) => epoch + 1);
         }
+      } else if (!nextHosts.length) {
+        bootLog("dataHosts.empty-mesh-poll", {
+          ready: dataHostsReady.current,
+          frozen: dataHostsRef.current.length,
+          meshError: m?.error || null,
+        });
       }
     } catch (e) {
       setPollErr(e.message);
     }
-  }, []);
+  }, [adoptNetworkClient]);
 
   // Keep mesh fresh on both tabs — Ops every 3s, Data every 5s (nodes looked
   // stale when Data only polled health).
   useEffect(() => {
     tick();
-    const ms = tab === "ops" ? 3000 : 5000;
+    const ms = tab === "network" ? 3000 : 5000;
     const id = setInterval(tick, ms);
     return () => clearInterval(id);
   }, [tick, tab]);
@@ -207,6 +285,13 @@ export default function App() {
     setDataErr(false);
     setDataStatus("reset · refreshing peers…");
     try {
+      // Drop the persisted peer trace so Aggregate/Nearby remount cold —
+      // otherwise seedPeers resurrect terminated EC2s as ghost nodes.
+      const networkId = activeNetworkId || activeNetworkRef.current || "";
+      clearSeedPeers(networkId);
+      nearbyNetDisposeRef.current?.();
+      nearbyNetDisposeRef.current = null;
+      setNearbyController(null);
       const [m, h] = await Promise.all([
         getMesh(),
         getHealth().catch(() => null),
@@ -217,6 +302,11 @@ export default function App() {
       const nextHost =
         m?.bootstrap || bootstrapHost(nextBoot, h?.p2p_port || 21000);
       const nextHosts = hostsFromMesh(m, nextHost);
+      bootLog("refresh.click", {
+        networkId,
+        hosts: nextHosts,
+        answering: m?.totals?.answering ?? null,
+      });
       dataHostsReady.current = nextHosts.length > 0;
       dataHostsRef.current = nextHosts;
       setDataHosts(nextHosts);
@@ -238,11 +328,193 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }, [activeNetworkId]);
+
+  const refreshNetworkContext = useCallback(async () => {
+    const [registry, collectionList] = await Promise.all([
+      getNetworks(),
+      getCollections().catch(() => ({ collections: [] })),
+    ]);
+    setNetworks(registry?.networks || []);
+    setCollections(collectionList?.collections || []);
+    if (registry?.active) adoptNetworkClient(registry.active);
+    return registry;
+  }, [adoptNetworkClient]);
+
+  const handleSelectNetwork = useCallback(
+    async (networkId) => {
+      if (!networkId || networkId === activeNetworkRef.current) return;
+      await selectNetwork(networkId);
+      adoptNetworkClient(networkId);
+      setBearer("");
+      await Promise.all([
+        resetData(),
+        refreshNetworkContext(),
+        ensureToken(networkId).then(setBearer),
+      ]);
+    },
+    [adoptNetworkClient, refreshNetworkContext, resetData],
+  );
+
+  const handleNetworkLifecycle = useCallback(
+    async (networkId, action) => {
+      const out = await networkLifecycle(networkId, action);
+      adoptNetworkClient(networkId);
+      setBearer("");
+      await Promise.all([
+        resetData(),
+        refreshNetworkContext(),
+        action === "wake"
+          ? ensureToken(networkId).then(setBearer)
+          : Promise.resolve(),
+      ]);
+      return out;
+    },
+    [adoptNetworkClient, refreshNetworkContext, resetData],
+  );
+
+  const handleTopNetworkLifecycle = useCallback(
+    async (action) => {
+      const target = networks.find((network) => network.id === activeNetworkId);
+      if (!target) return;
+      if (
+        action === "sleep" &&
+        !confirm(
+          `Save and sleep ${target.label || target.id}? Data stays in the object store.`,
+        )
+      ) {
+        return;
+      }
+      setNetworkActionBusy(true);
+      try {
+        await handleNetworkLifecycle(target.id, action);
+      } catch (error) {
+        alert(error.message || String(error));
+      } finally {
+        setNetworkActionBusy(false);
+      }
+    },
+    [activeNetworkId, handleNetworkLifecycle, networks],
+  );
+
+  const handleCreateNetwork = useCallback(
+    async (input) => {
+      const out = await createNetwork(input);
+      const networkId = out?.network?.id;
+      if (networkId) adoptNetworkClient(networkId);
+      setBearer("");
+      await Promise.all([
+        resetData(),
+        refreshNetworkContext(),
+        networkId ? ensureToken(networkId).then(setBearer) : Promise.resolve(),
+      ]);
+      return out;
+    },
+    [adoptNetworkClient, refreshNetworkContext, resetData],
+  );
+
+  const submitNetworkCreate = useCallback(
+    async (input) => {
+      setResourceBusy(true);
+      setResourceError("");
+      try {
+        await handleCreateNetwork(input);
+        setNetworkCreateOpen(false);
+      } catch (error) {
+        setResourceError(error.message || String(error));
+      } finally {
+        setResourceBusy(false);
+      }
+    },
+    [handleCreateNetwork],
+  );
+
+  const handleDeleteNetwork = useCallback(
+    async (networkId) => {
+      const target = networks.find((network) => network.id === networkId);
+      if (!target) return;
+      if (target.state !== "asleep") {
+        alert("Sleep this network before removing it from the dashboard.");
+        return;
+      }
+      if (
+        !confirm(
+          `Remove "${target.label || target.id}" from the dashboard?\n\nCompute and object-store data are not destroyed.`,
+        )
+      ) {
+        return;
+      }
+      try {
+        await networkLifecycle(networkId, "delete");
+        const registry = await refreshNetworkContext();
+        if (registry?.active) {
+          adoptNetworkClient(registry.active);
+          await resetData();
+        } else {
+          setActiveNetworkId("");
+          setBearer("");
+          await resetData();
+        }
+      } catch (error) {
+        alert(error.message || String(error));
+      }
+    },
+    [adoptNetworkClient, networks, refreshNetworkContext, resetData],
+  );
+
+  const submitCollectionCreate = useCallback(async (name) => {
+    setResourceBusy(true);
+    setResourceError("");
+    try {
+      const out = await createCollection(name);
+      const created = out?.collection || name;
+      setCollections(out?.collections || ((current) => [...new Set([...current, created])]));
+      setCollection(created);
+      setCollectionCreateOpen(false);
+    } catch (error) {
+      setResourceError(error.message || String(error));
+    } finally {
+      setResourceBusy(false);
+    }
   }, []);
 
+  /** Wipe client /sets cache (owners too) and force wire re-fetch — no remount. */
+  const clearDataCache = useCallback(() => {
+    setDataStatus("cache cleared · refetching…");
+    aggregateCacheApiRef.current?.clearSetsCache?.({ owners: true });
+  }, []);
+
+  const handleDeleteCollection = useCallback(
+    async (name) => {
+      if (!name) return;
+      if (
+        !confirm(
+          `Permanently delete collection "${name}" and its zone snapshots from the active network?`,
+        )
+      ) {
+        return;
+      }
+      try {
+        const out = await deleteCollection(name);
+        if (!out?.ok) throw new Error(`Collection delete was partial for ${name}`);
+        setCollections((current) => current.filter((item) => item !== name));
+        if (collection === name) {
+          setCollection(
+            collections.find((item) => item !== name) || COLLECTION_PRESETS[0].id,
+          );
+        }
+        clearDataCache();
+      } catch (error) {
+        alert(error.message || String(error));
+      }
+    },
+    [clearDataCache, collection, collections],
+  );
+
   useEffect(() => {
+    if (!activeNetworkId) return undefined;
     let cancelled = false;
-    ensureToken()
+    ensureToken(activeNetworkId)
       .then((tok) => {
         if (!cancelled) setBearer(tok);
       })
@@ -255,7 +527,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeNetworkId]);
 
   useEffect(() => {
     const key = `${collection}|${origin.lat.toFixed(6)}|${origin.lng.toFixed(6)}`;
@@ -270,9 +542,10 @@ export default function App() {
     }
   }, [collection, origin.lat, origin.lng, mode]);
 
-  // Eager Nearby Network so Nodes / Metrics match Aggregate before first Query.
+  // Nearby Nodes/Metrics ride the shared Aggregate worker Network (no second
+  // main-thread Network). Wait until AggregateHeatmap fills cacheApiRef.
   useEffect(() => {
-    if (mode !== "nearby" || !hosts.length || tab !== "data") {
+    if (mode !== "nearby" || !hosts.length || tab !== "client") {
       nearbyNetDisposeRef.current?.();
       nearbyNetDisposeRef.current = null;
       setNearbyController(null);
@@ -282,52 +555,44 @@ export default function App() {
     }
 
     let cancelled = false;
-
-    (async () => {
-      try {
-        if (!sessionRef.current) {
-          sessionRef.current = new SearchSession({
-            collectionName: collection,
-            hosts,
-            lat: origin.lat,
-            lng: origin.lng,
-            step,
-            readOptions,
-          });
-        }
-        await sessionRef.current.ensure();
-        if (cancelled) return;
-        const net = sessionRef.current.network;
-        if (!net) return;
-        nearbyNetDisposeRef.current?.();
-        const ctrl = attachNetworkController(net);
-        nearbyNetDisposeRef.current = () => ctrl.dispose();
-        setNearbyController(ctrl);
-      } catch (e) {
-        if (cancelled) return;
+    const attach = () => {
+      const api = aggregateCacheApiRef.current;
+      if (!api?.subscribeNetwork) return false;
+      nearbyNetDisposeRef.current?.();
+      setNearbyController({
+        subscribeNetwork: api.subscribeNetwork,
+        forgetPeer: api.forgetPeer,
+      });
+      nearbyNetDisposeRef.current = () => {
         setNearbyController(null);
-        setNearbyNodeCount(0);
-        setNearbyMetricsHint(null);
-        setDataErr(true);
-        setDataStatus(e.message || String(e));
-      }
-    })();
+      };
+      return true;
+    };
 
-    return () => {
+    if (attach()) return () => {
       cancelled = true;
       nearbyNetDisposeRef.current?.();
       nearbyNetDisposeRef.current = null;
     };
-  }, [
-    mode,
-    tab,
-    hosts,
-    collection,
-    origin.lat,
-    origin.lng,
-    readOptions,
-    dataEpoch,
-  ]);
+
+    const timer = setInterval(() => {
+      if (cancelled) return;
+      if (attach()) clearInterval(timer);
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      nearbyNetDisposeRef.current?.();
+      nearbyNetDisposeRef.current = null;
+    };
+  }, [mode, tab, hosts, collection, dataEpoch, bearer]);
+
+  useEffect(() => {
+    aggregateCacheApiRef.current?.setSurface?.(
+      mode === "nearby" ? "nearby" : "aggregate",
+    );
+  }, [mode]);
 
   useEffect(() => {
     if (!nearbyController?.subscribeNetwork) return undefined;
@@ -376,7 +641,22 @@ export default function App() {
             lng: origin.lng,
             step,
             readOptions,
+            workerSearch: (opts) => {
+              const api = aggregateCacheApiRef.current;
+              if (!api?.searchNearby) {
+                throw new Error(
+                  "mesh worker not ready — wait for Aggregate INIT",
+                );
+              }
+              return api.searchNearby(opts);
+            },
           });
+        } else {
+          sessionRef.current.lat = origin.lat;
+          sessionRef.current.lng = origin.lng;
+          sessionRef.current.step = step;
+          sessionRef.current.hosts = hosts;
+          sessionRef.current.collectionName = collection;
         }
         if (!next) cumulativeRef.current = [];
         const { items, peers } = await sessionRef.current.search(step, {
@@ -421,7 +701,7 @@ export default function App() {
   }, [busy, canNext, runSearch]);
 
   useEffect(() => {
-    if (!auto || mode !== "nearby" || !hosts.length || tab !== "data") return;
+    if (!auto || mode !== "nearby" || !hosts.length || tab !== "client") return;
     if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
     autoTimerRef.current = setTimeout(() => {
       runSearch(false);
@@ -444,7 +724,7 @@ export default function App() {
   // First Nearby round as soon as the mode is picked (hosts + Data tab ready).
   useEffect(() => {
     if (!nearbyBootRef.current) return;
-    if (mode !== "nearby" || tab !== "data" || !hosts.length) return;
+    if (mode !== "nearby" || tab !== "client" || !hosts.length) return;
     nearbyBootRef.current = false;
     if (auto) return; // auto effect already queries on entry
     const t = setTimeout(() => {
@@ -539,52 +819,91 @@ export default function App() {
         onTheme={setTheme}
         tab={tab}
         onTab={setTab}
+        networks={networks}
+        activeNetworkId={activeNetworkId}
+        onNetwork={handleSelectNetwork}
+        onCreateNetwork={() => {
+          setResourceError("");
+          setNetworkCreateOpen(true);
+        }}
+        onDeleteNetwork={handleDeleteNetwork}
+        collections={collections}
         collection={collection}
         onCollection={setCollection}
-        mode={mode}
-        onMode={onMode}
-        readNavigation={readNavigation}
-        onReadNavigation={onReadNavigation}
-        readMethod={readMethod}
-        onReadMethod={onReadMethod}
+        onCreateCollection={() => {
+          setResourceError("");
+          setCollectionCreateOpen(true);
+        }}
+        onDeleteCollection={handleDeleteCollection}
         peerHint={peerHint}
         onReset={resetData}
-        busy={busy}
+        busy={busy || resourceBusy || networkActionBusy}
       />
 
       {pollErr && <div className="err-banner">{pollErr}</div>}
 
       <div
-        className={tab === "ops" ? "tab-panel" : "tab-panel hidden"}
-        hidden={tab !== "ops"}
+        className={tab === "network" ? "tab-panel" : "tab-panel hidden"}
+        hidden={tab !== "network"}
       >
-        <OpsPanel mesh={mesh} onSelectCollection={setCollection} />
+        <OpsPanel
+          mesh={mesh}
+          collection={collection}
+          onSelectCollection={setCollection}
+          onCollectionDeleted={(name) => {
+            clearDataCache();
+            setCollections((current) => current.filter((item) => item !== name));
+            if (collection === name) setCollection(COLLECTION_PRESETS[0].id);
+          }}
+          activeNetwork={
+            networks.find((network) => network.id === activeNetworkId) || null
+          }
+          onNetworkLifecycle={handleTopNetworkLifecycle}
+          networkActionBusy={networkActionBusy}
+        />
       </div>
 
       <div
-        className={tab === "data" ? "tab-panel" : "tab-panel hidden"}
-        hidden={tab !== "data"}
+        className={tab === "client" ? "tab-panel" : "tab-panel hidden"}
+        hidden={tab !== "client"}
       >
         <section className="data-section">
           <div className="data-layout">
-            {mode === "aggregate" ? (
-              <AggregateHeatmap
-                key={`agg-${dataEpoch}-${collection}-${readNavigation}-${readMethod}`}
-                collection={collection}
-                hosts={hosts}
-                bearer={bearer}
-                detailLimit={detailLimit}
-                center={mapViewportRef.current.aggregate.center}
-                zoom={mapViewportRef.current.aggregate.zoom}
-                theme={theme}
-                onStatus={onAggStatus}
-                onAddClick={() => setAddOpen(true)}
-                sideView={sideView}
-                onSideView={setSideView}
-                onViewportChange={onAggregateViewport}
-                readOptions={readOptions}
-              />
-            ) : (
+            {hosts.length > 0 ? (
+              <div
+                className={mode === "aggregate" ? undefined : "hidden"}
+                hidden={mode !== "aggregate"}
+              >
+                <AggregateHeatmap
+                  key={`agg-${dataEpoch}-${collection}-${readNavigation}-${readMethod}`}
+                  collection={collection}
+                  hosts={hosts}
+                  bearer={bearer}
+                  detailLimit={detailLimit}
+                  center={mapViewportRef.current.aggregate.center}
+                  zoom={mapViewportRef.current.aggregate.zoom}
+                  theme={theme}
+                  onStatus={onAggStatus}
+                  onAddClick={() => setAddOpen(true)}
+                  sideView={sideView}
+                  onSideView={setSideView}
+                  sideCollapsed={sideCollapsed}
+                  onToggleSideCollapsed={() => setSideCollapsed((v) => !v)}
+                  onViewportChange={onAggregateViewport}
+                  readOptions={readOptions}
+                  cacheApiRef={aggregateCacheApiRef}
+                  onMode={onMode}
+                  readNavigation={readNavigation}
+                  onReadNavigation={onReadNavigation}
+                  readMethod={readMethod}
+                  onReadMethod={onReadMethod}
+                  onClearCache={clearDataCache}
+                  busy={busy}
+                  surface={mode === "nearby" ? "nearby" : "aggregate"}
+                />
+              </div>
+            ) : null}
+            {mode === "nearby" ? (
               <>
                 <MapPanel
                   key={`near-${dataEpoch}`}
@@ -594,16 +913,25 @@ export default function App() {
                   hits={displayHits}
                   onMapClick={onMapClick}
                   onHitFocus={onHitFocus}
-                  active={tab === "data"}
+                  active={tab === "client"}
                   fitNonce={fitNonce}
                   theme={theme}
                   normalizer={normalizer}
                   hoverHit={hoveredHit}
                   onViewportChange={onNearbyViewport}
+                  onMode={onMode}
+                  waiting={!hosts.length || !bearer}
+                  waitingMessage={
+                    !hosts.length
+                      ? "waiting for mesh hosts…"
+                      : "issuing bearer for heatmap worker…"
+                  }
                 />
                 <DataSidePanel
                   view={sideView}
                   onView={setSideView}
+                  collapsed={sideCollapsed}
+                  onToggleCollapsed={() => setSideCollapsed((v) => !v)}
                   onAddClick={() => setAddOpen(true)}
                   itemCount={displayHits.length}
                   nodeCount={nearbyNodeCount}
@@ -621,6 +949,11 @@ export default function App() {
                       onNext={loadNextHits}
                       canNext={canNext}
                       busy={busy}
+                      readNavigation={readNavigation}
+                      onReadNavigation={onReadNavigation}
+                      readMethod={readMethod}
+                      onReadMethod={onReadMethod}
+                      onClearCache={clearDataCache}
                     />
                   }
                   items={
@@ -639,7 +972,7 @@ export default function App() {
                   metrics={<ClientMetrics controller={nearbyController} />}
                 />
               </>
-            )}
+            ) : null}
           </div>
 
           <AddItemModal
@@ -662,12 +995,31 @@ export default function App() {
         </section>
       </div>
 
+      <NetworkCreateModal
+        open={networkCreateOpen}
+        busy={resourceBusy}
+        error={resourceError}
+        onClose={() => setNetworkCreateOpen(false)}
+        onCreate={submitNetworkCreate}
+      />
+      <CollectionCreateModal
+        open={collectionCreateOpen}
+        busy={resourceBusy}
+        error={resourceError}
+        networkLabel={
+          networks.find((network) => network.id === activeNetworkId)?.label ||
+          activeNetworkId
+        }
+        onClose={() => setCollectionCreateOpen(false)}
+        onCreate={submitCollectionCreate}
+      />
+
       <footer className="app-foot">
-        {tab === "ops"
-          ? "ops · mesh · spawn · snapshots · data load"
+        {tab === "network"
+          ? "network · mesh · spawn · snapshots · data load"
           : mode === "nearby"
-            ? "nearby · Local.search · auto query / Next N"
-            : "aggregate · €/m² · WebGPU"}
+            ? "client · nearby · Local.search · auto query / Next N"
+            : "client · aggregate · €/m² · WebGPU"}
       </footer>
     </div>
   );

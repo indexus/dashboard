@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   clearSnapshots,
-  downscale,
+  deleteCollection,
   flushSnapshots,
   getDvfStatus,
   getMeshConfig,
@@ -64,8 +64,8 @@ function nodePhase(n, leaveAgeS = 0) {
     }
     return "leaving";
   }
-  if (n.client_ready === false) {
-    // PreferNear ignored by sticky cert → 0 zones forever, never client_ready.
+  if (n.write_ready === false) {
+    // PreferNear ignored by sticky cert → 0 zones forever, never write_ready.
     // Or inbound snapshot handoff stuck (CaughtUp / SwitchAck never finished).
     if (
       (n.uptime_s ?? 0) >= STUCK_JOIN_S &&
@@ -96,11 +96,10 @@ function phaseLabel(phase, n) {
   }
   if (phase === "stuck_joining") {
     return (n.deleg_in ?? 0) > 0
-      ? `stuck joining · deleg_in · prep ${fmt(n.items_prep)}`
+      ? `stuck joining · deleg_in`
       : "stuck joining · 0 zones";
   }
   if (phase === "joining") {
-    const prep = n.items_prep ?? 0;
     return prep > 0 ? `joining · prep ${fmt(prep)}` : "joining";
   }
   if (phase === "transferring") {
@@ -199,7 +198,7 @@ function nodeStats(n) {
   return {
     answering: n.up ? 1 : 0,
     items: n.items ?? null,
-    items_prep: n.items_prep ?? null,
+    held: n.held ?? null,
     queue: n.queue ?? null,
     scale_ups: n.scale_ups_done ?? null,
     mem_pct: n.mem_pct ?? null,
@@ -218,7 +217,7 @@ function nodeStats(n) {
     transferring: n.transferring || n.rebalancing ? 1 : 0,
     rebalancing: n.rebalancing ? 1 : 0,
     leaving: n.leaving ? 1 : 0,
-    not_ready: n.up && n.client_ready === false ? 1 : 0,
+    not_ready: n.up && n.write_ready === false ? 1 : 0,
   };
 }
 
@@ -230,7 +229,7 @@ function meshNodeStats(nodes) {
     return {
       answering: 0,
       items: null,
-      items_prep: null,
+      held: null,
       queue: null,
       scale_ups: null,
       mem_pct: null,
@@ -255,7 +254,7 @@ function meshNodeStats(nodes) {
   return {
     answering: up.length,
     items: sum(pool.map((n) => n.items)),
-    items_prep: sum(pool.map((n) => n.items_prep)),
+    held: sum(pool.map((n) => n.held)),
     queue: sum(pool.map((n) => n.queue)),
     scale_ups: sum(pool.map((n) => n.scale_ups_done)),
     mem_pct: mean(pool.map((n) => n.mem_pct)),
@@ -279,7 +278,7 @@ function meshNodeStats(nodes) {
     rebalancing: sum(pool.map((n) => (n.rebalancing ? 1 : 0))),
     leaving: sum(pool.map((n) => (n.leaving ? 1 : 0))),
     not_ready: sum(
-      pool.map((n) => (n.up && n.client_ready === false ? 1 : 0)),
+      pool.map((n) => (n.up && n.write_ready === false ? 1 : 0)),
     ),
   };
 }
@@ -344,7 +343,7 @@ const CHART_GROUPS = {
         rollup: "sum",
       },
       {
-        id: "items_prep",
+        id: "held",
         label: "items prep",
         color: "#d4a574",
         unit: "",
@@ -484,7 +483,15 @@ function formatMetricNow(metric, value) {
   return fmt(value);
 }
 
-export default function OpsPanel({ mesh, onSelectCollection }) {
+export default function OpsPanel({
+  mesh,
+  collection,
+  onSelectCollection,
+  onCollectionDeleted,
+  activeNetwork = null,
+  onNetworkLifecycle,
+  networkActionBusy = false,
+}) {
   const chart1Ref = useRef(null);
   const chart2Ref = useRef(null);
   const chart3Ref = useRef(null);
@@ -499,6 +506,7 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
   const [preferNear, setPreferNear] = useState("");
   const [spawnStatus, setSpawnStatus] = useState("");
   const [snapStatus, setSnapStatus] = useState("—");
+  const [snapshotPrefix, setSnapshotPrefix] = useState("");
   const [busy, setBusy] = useState(false);
   const [sideTab, setSideTab] = useState("data");
   /** @type {React.MutableRefObject<Map<string, number>>} */
@@ -513,6 +521,10 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
   const [dvfStatus, setDvfStatus] = useState(null);
   const [dvfMsg, setDvfMsg] = useState("");
 
+  useEffect(() => {
+    if (collection) setDvfCollection(collection);
+  }, [collection]);
+
   const [configDraft, setConfigDraft] = useState(null);
   const [configDirty, setConfigDirty] = useState(false);
   const [keepSnapshots, setKeepSnapshots] = useState(false);
@@ -522,7 +534,12 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
   const savedConfigRef = useRef(null);
   const [savedTick, setSavedTick] = useState(0);
 
-  const nodes = mesh?.nodes || [];
+  // Down / unreachable hosts stay out of the Ops table — mesh poll still
+  // carries them briefly after terminate, but they must not linger in the UI.
+  const nodes = useMemo(
+    () => (mesh?.nodes || []).filter((n) => n?.up),
+    [mesh?.nodes],
+  );
   const snaps = mesh?.snapshots || {};
   const lim = mesh?.autoscale || {};
 
@@ -536,6 +553,10 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
     () => nodes.find((n) => `${n.ip}:${n.mon}` === selectedKey) || null,
     [nodes, selectedKey],
   );
+
+  useEffect(() => {
+    if (selectedKey && !selected) setSelectedKey(null);
+  }, [selectedKey, selected]);
 
   const liveNode = useMemo(() => {
     if (selected) return selected;
@@ -794,36 +815,23 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
     }
   }
 
-  async function onDown() {
-    if (!selected?.instance_id) return;
-    if (!confirm(`Downscale ${selected.instance_id}?`)) return;
-    setBusy(true);
-    setSpawnStatus("downscaling…");
-    try {
-      await downscale({ instance_id: selected.instance_id });
-      setSpawnStatus(`downscale ${selected.instance_id}`);
-      setSelectedKey(null);
-    } catch (e) {
-      setSpawnStatus(e.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onForceRemove() {
-    if (!selected?.instance_id) return;
-    const id = selected.instance_id;
+  async function onRemove() {
+    const id = selected?.instance_id || selected?.ip;
+    if (!id) return;
     if (
       !confirm(
-        `Force-remove ${id}? Kills the process without SoftLeave (use for stuck joining/leaving ghosts).`,
+        `Remove ${id}? This permanently terminates the instance without Drain.`,
       )
     ) {
       return;
     }
     setBusy(true);
-    setSpawnStatus(`force-remove ${id}…`);
+    setSpawnStatus(`removing ${id}…`);
     try {
-      await terminate({ instance_id: id });
+      await terminate({
+        instance_id: selected.instance_id || undefined,
+        ip: selected.ip || undefined,
+      });
       setSpawnStatus(`terminated ${id}`);
       setSelectedKey(null);
     } catch (e) {
@@ -833,13 +841,13 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
     }
   }
 
-  async function onFlush(all) {
+  async function onFlush() {
     setBusy(true);
-    setSnapStatus(all ? "flushing all…" : "flushing…");
+    setSnapStatus("saving all…");
     try {
-      const out = await flushSnapshots(all);
+      const out = await flushSnapshots(true);
       const ok = (out.results || []).filter((r) => r.ok).length;
-      setSnapStatus(`flushed ${ok}/${(out.results || []).length}`);
+      setSnapStatus(`saved ${ok}/${(out.results || []).length}`);
     } catch (e) {
       setSnapStatus(e.message);
     } finally {
@@ -848,19 +856,56 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
   }
 
   async function onClear() {
-    if (!confirm("Clear object-store snapshots (zones/, nodes/, snapshots/)?"))
-      return;
+    const target = snapshotPrefix || "zones/, nodes/, snapshots/";
+    if (!confirm(`Permanently clear ${target}?`)) return;
     setBusy(true);
-    setSnapStatus("clearing…");
+    setSnapStatus(snapshotPrefix ? `clearing ${snapshotPrefix}…` : "clearing all…");
     try {
-      const out = await clearSnapshots();
+      const out = await clearSnapshots(snapshotPrefix);
       setSnapStatus(
         out.available === false
           ? "store not attached"
-          : `cleared ${out.cleared ?? 0}`,
+          : `cleared ${out.cleared ?? 0}${
+              out.prefix
+                ? ` under ${String(out.prefix).replace(/\/$/, "")}`
+                : ""
+            }`,
       );
     } catch (e) {
       setSnapStatus(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDeleteCollection() {
+    const name = dvfCollection.trim();
+    if (!name) return;
+    if (
+      !confirm(
+        `Permanently delete collection "${name}" from every live node and its zone snapshots?`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setDvfMsg(`deleting ${name}…`);
+    try {
+      const out = await deleteCollection(name);
+      const results = out.results || [];
+      const ok = results.filter((result) => result.ok).length;
+      const removed = results.reduce(
+        (sum, result) => sum + (Number(result.removed_zones) || 0),
+        0,
+      );
+      setDvfMsg(
+        out.ok
+          ? `deleted ${name} · ${removed} zones on ${ok}/${results.length} nodes`
+          : `partial delete ${name} · ${ok}/${results.length} nodes`,
+      );
+      if (out.ok) onCollectionDeleted?.(name);
+    } catch (e) {
+      setDvfMsg(e.message);
     } finally {
       setBusy(false);
     }
@@ -1141,14 +1186,18 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
             </button>
             <button
               type="button"
-              className="warn"
+              className="danger"
               disabled={
-                busy || !selected?.instance_id || selected.role === "bootstrap"
+                busy ||
+                (!selected?.instance_id && !selected?.ip) ||
+                selected.role === "bootstrap"
               }
-              onClick={onDown}
+              onClick={onRemove}
               title={
-                selected?.instance_id
-                  ? `Downscale ${selected.instance_id}`
+                selected?.instance_id || selected?.ip
+                  ? `Permanently terminate ${
+                      selected.instance_id || selected.ip
+                    } (no Drain)`
                   : "Select a spawned node"
               }
             >
@@ -1156,27 +1205,24 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
             </button>
             <button
               type="button"
-              className="danger"
-              disabled={
-                busy || !selected?.instance_id || selected.role === "bootstrap"
+              className="primary ops-nodes-lifecycle"
+              disabled={busy || networkActionBusy || !activeNetwork}
+              onClick={() =>
+                onNetworkLifecycle?.(
+                  activeNetwork?.state === "asleep" ? "wake" : "sleep",
+                )
               }
-              onClick={onForceRemove}
               title={
-                selected?.instance_id
-                  ? `Force-kill ${selected.instance_id} (no SoftLeave)`
-                  : "Select a spawned node"
+                activeNetwork?.state === "asleep"
+                  ? "Wake network nodes"
+                  : "Checkpoint then sleep network nodes"
               }
             >
-              Force kill
-            </button>
-            <button
-              type="button"
-              className="danger"
-              disabled={busy || remeshBusy}
-              onClick={() => onRemesh({ keep_snapshots: false })}
-              title="Stop mesh, wipe .data-local/snapshots, run mesh_up.sh"
-            >
-              {remeshBusy ? "Restarting…" : "Clean & Restart"}
+              {networkActionBusy
+                ? "Working…"
+                : activeNetwork?.state === "asleep"
+                  ? "Wake"
+                  : "Sleep"}
             </button>
           </div>
 
@@ -1246,8 +1292,8 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                       ? "Click again to deselect (show mesh sums)"
                       : stuck
                       ? phase === "stuck_joining"
-                        ? "No zones after join — often sticky local-N.cert.json ignored PreferNear. Force kill or remesh."
-                        : "SoftLeave not finishing (large-zone /transfer timeout). Force kill or remesh."
+                        ? "No zones after join — often sticky local-N.cert.json ignored PreferNear. Remove or remesh."
+                        : "Drain not finishing (large-zone /transfer timeout). Remove or remesh."
                       : `Select · PreferNear from load-split (${
                           preferNearFromNode(n) || "…"
                         })`
@@ -1266,8 +1312,8 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                   </div>
                   <div title="official items · preparing (inbound snap)">
                     {fmt(n.items)}
-                    {(n.items_prep ?? 0) > 0 ? (
-                      <div className="sub">+{fmt(n.items_prep)} prep</div>
+                    {(n.held ?? 0) > 0 ? (
+                      <div className="sub">+{fmt(n.held)} held</div>
                     ) : null}
                   </div>
                   <div>{fmt(n.queue)}</div>
@@ -1411,7 +1457,7 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                       value={dvfYear}
                       onChange={(e) => setDvfYear(e.target.value)}
                     >
-                      {["2019", "2020", "2021", "2022", "2023", "2024"].map(
+                      {["2019", "2020", "2021", "2022", "2023", "2024", "2025"].map(
                         (y) => (
                           <option key={y} value={y}>
                             {y}
@@ -1439,9 +1485,21 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                   className="primary"
                   disabled={busy || loadRunning}
                   onClick={onLoadDvf}
+                  title="Load DVF into this collection (created on first write)"
                 >
-                  {loadRunning ? "Loading…" : "Load"}
+                  {loadRunning ? "Loading…" : "Load Collection"}
                 </button>
+                {!loadRunning ? (
+                  <button
+                    type="button"
+                    className="danger"
+                    disabled={busy || !dvfCollection.trim()}
+                    onClick={onDeleteCollection}
+                    title="Delete this collection from every live node and S3"
+                  >
+                    Delete collection
+                  </button>
+                ) : null}
                 {loadRunning ? (
                   <>
                     <button
@@ -1488,7 +1546,10 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                       <span>no object store</span>
                     </div>
                   ) : (
-                    <SnapshotsBrowser objects={objs} />
+                    <SnapshotsBrowser
+                      objects={objs}
+                      onPathChange={setSnapshotPrefix}
+                    />
                   )}
                 </div>
               </div>
@@ -1497,24 +1558,23 @@ export default function OpsPanel({ mesh, onSelectCollection }) {
                   type="button"
                   className="primary"
                   disabled={busy}
-                  onClick={() => onFlush(false)}
+                  onClick={onFlush}
+                  title="Save snapshots for every live node"
                 >
-                  Flush
-                </button>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => onFlush(true)}
-                >
-                  Flush all
+                  Save all
                 </button>
                 <button
                   type="button"
                   className="danger"
                   disabled={busy}
                   onClick={onClear}
+                  title={
+                    snapshotPrefix
+                      ? `Delete objects under ${snapshotPrefix}/`
+                      : "Delete all snapshot objects"
+                  }
                 >
-                  Clear
+                  {snapshotPrefix ? "Delete folder" : "Delete all"}
                 </button>
               </div>
             </>

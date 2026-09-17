@@ -1,13 +1,13 @@
-import { Local } from "../himo/js-indexus-sdk/index.js";
+import { Local } from "js-indexus-sdk";
 import {
   GPS_DIM,
   buildGpsCollection,
-} from "../himo/lib/indexus/collection.js";
-import { createDashboardNetwork } from "../himo/lib/indexus/networkFactory.js";
+} from "./indexus/collection.js";
+import { createDashboardNetwork } from "./indexus/networkFactory.js";
 import {
   DEFAULT_READ_OPTIONS,
   MESH_DISCOVERY_INTERVAL_MS,
-} from "../himo/lib/indexus/readDefaults.js";
+} from "./indexus/readDefaults.js";
 import { issueToken } from "./api.js";
 
 export { GPS_DIM };
@@ -18,8 +18,8 @@ export const DETAIL_LIMIT = 5;
 
 export const COLLECTION_PRESETS = [
   { id: "DvFMV2020idx0001", label: "DVF Maison|Vente" },
-  { id: "DENjYsMTAyLDE2ME", label: "himo DVF id (legacy)" },
-  { id: "FrGeoBenchAws00001", label: "bench geo (legacy)" },
+  { id: "DENjYsMTAyLDE2ME", label: "legacy DVF id" },
+  { id: "FrGeoBenchAws000", label: "bench geo (legacy)" },
 ];
 
 /** Canonical clean purchase collection for mesh_dash Aggregate (≤16 chars). */
@@ -45,13 +45,12 @@ export const METRIC_VALUE_INDEX = 2;
  * old 1000 before the user moves, and every eviction is a `/sets` we already
  * paid for.
  */
-const NEARBY_CACHE_SIZE = 20000;
+/** Keep drilled zones + item payloads in RAM across pans (was 20k). */
+const NEARBY_CACHE_SIZE = 100000;
 
 /**
- * Nearby and Aggregate share the same Network *code* and read knobs (gateway,
- * navigation, method, TTL). They do **not** share one live instance: Nearby
- * builds a Network on the main thread; Aggregate builds another inside the
- * worker. Local and Grid both call getSets against whichever Network they hold.
+ * Fallback main-thread Network (only if workerSearch is not provided).
+ * Prefer the shared Aggregate worker Network via SearchSession.workerSearch.
  *
  * @param {string[]} hosts - mesh bootstrap hosts, `ip|port`
  * @param {{ navigation?: "ingress"|"direct", method?: "getSet"|"getSets" }} [readOptions]
@@ -66,15 +65,211 @@ async function connect(hosts, readOptions = DEFAULT_READ_OPTIONS) {
   });
 }
 
-let tokenPromise = null;
+/**
+ * Nearby and Aggregate share one live Network inside the Aggregate heatmap
+ * worker (`/sets` cache size 200k). Nearby searches go through
+ * `cacheApi.searchNearby` → worker SEARCH on that Network. This session no
+ * longer builds a second main-thread Network when `workerSearch` is set.
+ *
+ * @param {{
+ *   collectionName: string,
+ *   hosts: string[],
+ *   lat: number,
+ *   lng: number,
+ *   step: number,
+ *   readOptions?: { navigation?: "ingress"|"direct", method?: "getSet"|"getSets" },
+ *   workerSearch?: (opts: {
+ *     lat: number,
+ *     lng: number,
+ *     step: number,
+ *     fresh?: boolean,
+ *   }) => Promise<{ items: object[], peers: number }>,
+ * }} opts
+ */
+export class SearchSession {
+  /**
+   * @param {{
+   *   collectionName: string,
+   *   hosts: string[],
+   *   lat: number,
+   *   lng: number,
+   *   step: number,
+   *   readOptions?: { navigation?: "ingress"|"direct", method?: "getSet"|"getSets" },
+   *   workerSearch?: Function,
+   * }} opts
+   */
+  constructor({ collectionName, hosts, lat, lng, step, readOptions, workerSearch }) {
+    this.collectionName = collectionName;
+    this.hosts = hosts;
+    this.lat = lat;
+    this.lng = lng;
+    this.step = step;
+    this.readOptions = {
+      navigation:
+        readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
+      method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
+      refreshTtlMs:
+        readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
+    };
+    this._workerSearch = typeof workerSearch === "function" ? workerSearch : null;
+    this._batch = [];
+    this._local = null;
+    this._network = null;
+    this._ready = null;
+  }
 
-export async function ensureToken() {
+  get network() {
+    return this._network;
+  }
+
+  /** Connect Network + Local (idempotent). Safe to call before first search. */
+  ensure() {
+    if (this._workerSearch) {
+      return Promise.resolve({ peers: 0, hosts: this.hosts, via: "worker" });
+    }
+    return this._ensure();
+  }
+
+  _buildLocal() {
+    const { space, gps } = buildCollection(this.collectionName);
+    const output = {
+      send: (results) => {
+        for (const r of results) this._batch.push(r);
+      },
+    };
+    const monitoring = { send: () => {} };
+    const options = {
+      cap: 1,
+      step: this.step,
+      origins: { gps: gps.newPoint([this.lat, this.lng]) },
+      filters: { gps: gps.newFilter([0, 0], [0, 360]) },
+    };
+    this._local = new Local(
+      { [this.collectionName]: space },
+      options,
+      output,
+      monitoring,
+      this._network,
+    );
+  }
+
+  async _ensure() {
+    if (this._ready) return this._ready;
+    this._ready = (async () => {
+      await ensureToken();
+      this._network = await connect(this.hosts, this.readOptions);
+      this._buildLocal();
+      return {
+        peers: this._network.listPeers().length,
+        hosts: this.hosts,
+      };
+    })();
+    return this._ready;
+  }
+
+  /**
+   * Fresh Query: rebuild Local on the same Network so Nodes/Metrics stay live.
+   */
+  async resetLocal() {
+    if (this._workerSearch) {
+      this._batch = [];
+      return;
+    }
+    await this._ensure();
+    this._batch = [];
+    this._buildLocal();
+  }
+
+  /**
+   * Wipe client `/sets` cache (+ owner pins) without dropping the Network.
+   * Prefer the shared worker clearSetsCache from the dashboard toolbar.
+   * @param {{ owners?: boolean, metrics?: boolean }} [opts]
+   */
+  clearSetsCache(opts = {}) {
+    if (this._network && typeof this._network.clearSetsCache === "function") {
+      this._network.clearSetsCache(opts);
+    }
+  }
+
+  /**
+   * Run one Local.search() advancing by `step` nearest items.
+   * @param {number} [step]
+   * @param {{ fresh?: boolean }} [opts] - when true, rebuild Local (Query)
+   * @returns {Promise<{ items: ReturnType<typeof summarizeItem>[], peers: number, hosts: string[] }>}
+   */
+  async search(step = this.step, opts = {}) {
+    this.step = step;
+    const origin = { lat: this.lat, lng: this.lng };
+
+    if (this._workerSearch) {
+      const raw = await this._workerSearch({
+        lat: this.lat,
+        lng: this.lng,
+        step,
+        fresh: opts.fresh !== false,
+      });
+      const items = (raw.items || []).map((hit, i) =>
+        summarizeItem(
+          {
+            id: () => hit.id,
+            hash: () => hit.hash,
+            metrics: () => hit.metrics,
+            distances: () => hit.distances,
+            _id: hit.id,
+            _hash: hit.hash,
+            _metrics: hit.metrics,
+            _distances: hit.distances,
+          },
+          i + 1,
+          origin,
+        ),
+      );
+      return {
+        items,
+        peers: raw.peers ?? 0,
+        hosts: this.hosts,
+      };
+    }
+
+    if (opts.fresh && this._network) {
+      await this.resetLocal();
+    } else {
+      await this._ensure();
+      if (this._local?.options) this._local.options.step = step;
+    }
+    this._batch = [];
+    await this._local.search();
+    const items = this._batch.map((r, i) => summarizeItem(r, i + 1, origin));
+    return {
+      items,
+      peers: this._network?.listPeers?.().length ?? 0,
+      hosts: this.hosts,
+    };
+  }
+}
+
+let tokenPromise = null;
+let tokenNetwork = null;
+
+export function resetToken(networkId = "") {
+  tokenPromise = null;
+  tokenNetwork = networkId || null;
+  globalThis.__INDEXUS_NETWORK_ID__ = networkId || "";
+  globalThis.__INDEXUS_BEARER__ = "";
+}
+
+export async function ensureToken(
+  networkId = globalThis.__INDEXUS_NETWORK_ID__ || "default",
+) {
+  if (tokenNetwork !== networkId) resetToken(networkId);
   if (globalThis.__INDEXUS_BEARER__) return globalThis.__INDEXUS_BEARER__;
   if (!tokenPromise) {
     tokenPromise = issueToken()
       .then((d) => {
         const tok = d.token || d.access_token;
         if (!tok) throw new Error("issuer returned no token");
+        tokenNetwork = networkId;
+        globalThis.__INDEXUS_NETWORK_ID__ = networkId;
         globalThis.__INDEXUS_BEARER__ = tok;
         return tok;
       })
@@ -201,117 +396,6 @@ export function summarizeItem(item, rank, origin = null) {
   };
 }
 
-
-export class SearchSession {
-  /**
-   * @param {{
-   *   collectionName: string,
-   *   hosts: string[],
-   *   lat: number,
-   *   lng: number,
-   *   step: number,
-   *   readOptions?: { navigation?: "ingress"|"direct", method?: "getSet"|"getSets" },
-   * }} opts
-   */
-  constructor({ collectionName, hosts, lat, lng, step, readOptions }) {
-    this.collectionName = collectionName;
-    this.hosts = hosts;
-    this.lat = lat;
-    this.lng = lng;
-    this.step = step;
-    this.readOptions = {
-      navigation:
-        readOptions?.navigation ?? DEFAULT_READ_OPTIONS.navigation,
-      method: readOptions?.method ?? DEFAULT_READ_OPTIONS.method,
-      refreshTtlMs:
-        readOptions?.refreshTtlMs ?? DEFAULT_READ_OPTIONS.refreshTtlMs,
-    };
-    this._batch = [];
-    this._local = null;
-    this._network = null;
-    this._ready = null;
-  }
-
-  get network() {
-    return this._network;
-  }
-
-  /** Connect Network + Local (idempotent). Safe to call before first search. */
-  ensure() {
-    return this._ensure();
-  }
-
-  _buildLocal() {
-    const { space, gps } = buildCollection(this.collectionName);
-    const output = {
-      send: (results) => {
-        for (const r of results) this._batch.push(r);
-      },
-    };
-    const monitoring = { send: () => {} };
-    const options = {
-      cap: 1,
-      step: this.step,
-      origins: { gps: gps.newPoint([this.lat, this.lng]) },
-      filters: { gps: gps.newFilter([0, 0], [0, 360]) },
-    };
-    this._local = new Local(
-      { [this.collectionName]: space },
-      options,
-      output,
-      monitoring,
-      this._network,
-    );
-  }
-
-  async _ensure() {
-    if (this._ready) return this._ready;
-    this._ready = (async () => {
-      await ensureToken();
-      this._network = await connect(this.hosts, this.readOptions);
-      this._buildLocal();
-      return {
-        peers: this._network.listPeers().length,
-        hosts: this.hosts,
-      };
-    })();
-    return this._ready;
-  }
-
-  /**
-   * Fresh Query: rebuild Local on the same Network so Nodes/Metrics stay live.
-   */
-  async resetLocal() {
-    await this._ensure();
-    this._batch = [];
-    this._buildLocal();
-  }
-
-  /**
-   * Run one Local.search() advancing by `step` nearest items.
-   * @param {number} [step]
-   * @param {{ fresh?: boolean }} [opts] - when true, rebuild Local (Query)
-   * @returns {Promise<{ items: ReturnType<typeof summarizeItem>[], peers: number, hosts: string[] }>}
-   */
-  async search(step = this.step, opts = {}) {
-    this.step = step;
-    if (opts.fresh && this._network) {
-      await this.resetLocal();
-    } else {
-      await this._ensure();
-      if (this._local?.options) this._local.options.step = step;
-    }
-    this._batch = [];
-    await this._local.search();
-    const origin = { lat: this.lat, lng: this.lng };
-    const items = this._batch.map((r, i) => summarizeItem(r, i + 1, origin));
-    return {
-      items,
-      peers: this._network?.listPeers?.().length ?? 0,
-      hosts: this.hosts,
-    };
-  }
-}
 
 export async function addGeoItem({
   collectionName,

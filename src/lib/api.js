@@ -20,6 +20,43 @@ export function getHealth() {
   return fetch("/api/health").then(parse);
 }
 
+export function getNetworks() {
+  return fetch("/api/networks").then(parse);
+}
+
+export function createNetwork(body) {
+  return fetch("/api/networks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  }).then(parse);
+}
+
+export function selectNetwork(id) {
+  return fetch("/api/networks/active", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  }).then(parse);
+}
+
+export function networkLifecycle(id, action) {
+  return fetch(
+    `/api/networks/${encodeURIComponent(id)}/${encodeURIComponent(action)}`,
+    { method: "POST" },
+  )
+    .then(parse)
+    .catch((err) => {
+      const msg = err?.message || String(err);
+      if (/Failed to fetch|NetworkError|ERR_/i.test(msg)) {
+        throw new Error(
+          `${action} failed: dashboard proxy timed out or api unreachable (wake/sleep can take minutes)`,
+        );
+      }
+      throw err;
+    });
+}
+
 export function spawn(body) {
   return fetch("/api/spawn", {
     method: "POST",
@@ -45,7 +82,7 @@ export function downscale(body) {
   }).then(parse);
 }
 
-/** Force-kill a local spawned instance (no SoftLeave). */
+/** Force-kill a local or AWS spawned instance (no Drain). */
 export function terminate(body) {
   return fetch("/api/terminate", {
     method: "POST",
@@ -62,11 +99,32 @@ export function flushSnapshots(all = false) {
   }).then(parse);
 }
 
-export function clearSnapshots() {
+export function clearSnapshots(prefix = "") {
   return fetch("/api/snapshots/clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: "{}",
+    body: JSON.stringify({ prefix }),
+  }).then(parse);
+}
+
+/** Permanently delete one collection from every live mesh node. */
+export function deleteCollection(name) {
+  return fetch("/api/collections/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  }).then(parse);
+}
+
+export function getCollections() {
+  return fetch("/api/collections").then(parse);
+}
+
+export function createCollection(name) {
+  return fetch("/api/collections", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
   }).then(parse);
 }
 

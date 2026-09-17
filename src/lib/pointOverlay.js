@@ -1,12 +1,12 @@
 /**
- * MapLibre circle layer for discrete sale points (ported from himo MapScreen).
+ * MapLibre circle layer for discrete sale points.
  * Colors use clamp(v / normalizer) against the active theme prix/m² ramp.
  */
 import {
   COLLECTION_DEFAULTS,
   HEATMAP_COLOR_SCALE_DARK,
   HEATMAP_COLOR_SCALE_WHITE,
-} from "@himo/lib/heatmap.js";
+} from "@indexus/rendering-map";
 
 export const POINT_SOURCE_ID = "average-grid-points-source";
 export const POINT_LAYER_ID = "average-grid-points-layer";

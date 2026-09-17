@@ -12,8 +12,8 @@ import {
   lightenDatavizDarkRoads,
   tuneDatavizDarkBackgroundAndWater,
   whitenBackdropRoadLabels,
-} from "@himo/components/mapStyle.js";
-import { COLLECTION_DEFAULTS } from "@himo/lib/heatmap.js";
+} from "@indexus/rendering-map";
+import { COLLECTION_DEFAULTS } from "@indexus/rendering-map";
 import {
   POINT_LAYER_ID,
   applyHitsOverlay,
@@ -21,6 +21,7 @@ import {
   getColoredPointPaint,
   hitHoverKey,
 } from "../lib/pointOverlay.js";
+import MapModeSwitch from "./MapModeSwitch.jsx";
 
 /** Same MapTiler basemaps as AggregateHeatmap. */
 const MAP_STYLES = {
@@ -75,6 +76,10 @@ export default function MapPanel({
   hoverHit = null,
   zoom: zoomProp,
   onViewportChange,
+  onMode,
+  /** Mirror Aggregate: badge/overlay while mesh or bearer is not ready. */
+  waiting = false,
+  waitingMessage = "waiting for mesh hosts…",
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -314,7 +319,14 @@ export default function MapPanel({
   return (
     <div className={`map-wrap map-wrap--${mode}`}>
       <div className="map-el" ref={containerRef} />
-      <div className="map-mode-badge">nearby</div>
+      <MapModeSwitch
+        mode="nearby"
+        onMode={onMode}
+        detail={waiting ? "waiting" : ""}
+      />
+      {waiting ? (
+        <div className="map-waiting-msg">{waitingMessage}</div>
+      ) : null}
       <div
         className="heatmap-legend"
         title={`prix/m² · normalizer ${normalizer}`}

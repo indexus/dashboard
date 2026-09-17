@@ -113,8 +113,8 @@ function LiveView({ node }) {
         <Row label="instance" tip="local-N or cloud instance id." value={fmt(node.instance_id)} />
         <Row label="version" tip="Binary / build version." value={fmt(node.version)} />
         <Row label="uptime" tip="Process uptime." value={fmtUptime(node.uptime_s)} />
-        <Row label="ready" tip="client_ready after join." value={fmt(node.client_ready)} />
-        <Row label="leaving" tip="SoftLeave in progress." value={fmt(node.leaving)} />
+        <Row label="ready" tip="write_ready after join." value={fmt(node.write_ready)} />
+        <Row label="leaving" tip="Drain in progress." value={fmt(node.leaving)} />
         <Row
           label="rebalancing"
           tip="Ownership moving across zones."
@@ -129,9 +129,9 @@ function LiveView({ node }) {
           value={fmt(node.items)}
         />
         <Row
-          label="items prep"
-          tip="Inbound snapshot items not yet SwitchAck'd."
-          value={fmt(node.items_prep)}
+          label="held"
+          tip="Ingress items parked while their zone is frozen for transfer."
+          value={fmt(node.held)}
         />
         <Row
           label="items limit"
@@ -200,11 +200,11 @@ function LiveView({ node }) {
         />
         <Row
           label="down in flight"
-          tip="SoftLeave pending."
+          tip="Drain pending."
           value={fmt(a.down_in_flight ?? node.down_in_flight)}
         />
         <Row label="last up" tip="Last scale-up time." value={fmt(a.last_up_at)} />
-        <Row label="last down" tip="Last SoftLeave time." value={fmt(a.last_down_at)} />
+        <Row label="last down" tip="Last Drain time." value={fmt(a.last_down_at)} />
       </Group>
     </div>
   );
@@ -535,7 +535,7 @@ export function MeshConfigEditor({
         </SliderRow>
         <SliderRow
           label="queue abs"
-          tip="Queue backlog that blocks scale-down (queuePressure). Not a scale-up trigger; SoftLeave drains on its own deadline."
+          tip="Queue backlog that blocks scale-down (queuePressure). Not a scale-up trigger; Drain drains on its own deadline."
           valueLabel={formatCount(draft.queue_pressure)}
           dirty={isDirty("queue_pressure")}
         >
@@ -577,7 +577,7 @@ export function MeshConfigEditor({
         />
         <DurationSlider
           label="down hold"
-          tip="How long the scale-down condition must hold before SoftLeave."
+          tip="How long the scale-down condition must hold before Drain."
           value={draft.scale_down_hold}
           onChange={(v) => set("scale_down_hold", v)}
           minSec={60}

@@ -44,7 +44,7 @@ const NODES = (process.env.NODES || process.env.NODE || "http://127.0.0.1:21000"
 const COUNT = parseInt(arg("count", "40000"), 10);
 const CONCURRENCY = parseInt(arg("concurrency", "32"), 10);
 const PRECISION = parseInt(arg("precision", "16"), 10);
-const COLLECTION_NAME = arg("collection", "WorldDensAws00001");
+const COLLECTION_NAME = arg("collection", "WorldDensAws0001");
 const DURATION_S = parseFloat(arg("duration", "0"));
 const CSV_PATH =
   process.env.DENSITY_CSV ||
@@ -171,14 +171,23 @@ async function main() {
   // Refresh often so PreferNear-spawned nodes enter the hop set quickly.
   const router = createRouter(NODES, {
     refreshEvery: 32,
-    refreshMs: 3000,
+    refreshMs: 2000,
     token,
   });
-  const mesh = await router.peers();
+  // Wait until XOR table has more than the seed (or timeout) so the ramp
+  // measures multi-node capacity instead of bootstrap-only warmup.
+  let mesh = await router.peers();
+  const waitUntil = Date.now() + parseInt(process.env.MESH_READY_MS || "15000", 10);
+  while (mesh.length < 2 && Date.now() < waitUntil) {
+    await new Promise((r) => setTimeout(r, 500));
+    await router.forceRefresh();
+    mesh = await router.peers();
+  }
   console.log(
     JSON.stringify({
       mesh_peers: mesh.map((p) => ({ hash: p.hash, base: p.base })),
       routing: "xor_nearest_item_key",
+      mesh_peer_count: mesh.length,
     })
   );
 

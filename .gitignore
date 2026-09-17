@@ -3,3 +3,7 @@ dist
 .run
 .DS_Store
 *.log
+
+# local runtime
+.data-local/
+\$REPORT

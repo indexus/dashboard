@@ -2,8 +2,12 @@
  * Bridge a main-thread Network into the same subscribeNetwork shape Aggregate
  * exposes from the worker (NodesList / ClientMetrics).
  *
- * @param {import("../himo/js-indexus-sdk/network/index.js").Network} network
- * @param {{ metricsIntervalMs?: number, activityFlushMs?: number }} [opts]
+ * @param {import("js-indexus-sdk").Network} network
+ * @param {{
+ *   metricsIntervalMs?: number,
+ *   activityFlushMs?: number,
+ *   onPeersChanged?: (peers: object[]) => void,
+ * }} [opts]
  */
 export function attachNetworkController(network, opts = {}) {
   if (!network) {
@@ -67,9 +71,11 @@ export function attachNetworkController(network, opts = {}) {
 
   if (typeof network.setPeersHandler === "function") {
     network.setPeersHandler((peers) => {
+      const nextPeers = Array.isArray(peers) ? peers : [];
+      opts.onPeersChanged?.(nextPeers);
       snap = {
         ...snap,
-        peers: Array.isArray(peers) ? peers : [],
+        peers: nextPeers,
         routingKey:
           typeof network.routingKeyHash === "function"
             ? network.routingKeyHash()
@@ -102,6 +108,11 @@ export function attachNetworkController(network, opts = {}) {
       subscribers.add(handler);
       handler(snap);
       return () => subscribers.delete(handler);
+    },
+    forgetPeer(hash) {
+      return typeof network.forgetPeer === "function"
+        ? network.forgetPeer(hash)
+        : false;
     },
     dispose() {
       if (typeof network.setActivityHandler === "function") {

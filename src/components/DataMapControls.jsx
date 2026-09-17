@@ -1,4 +1,4 @@
-import { AREA_MODE_CELL, AREA_MODE_DISK } from "@himo/lib/heatmap.js";
+import { AREA_MODE_CELL, AREA_MODE_DISK } from "@indexus/rendering-map";
 import Tip from "./Tip.jsx";
 
 /**
@@ -57,6 +57,27 @@ function CheckRow({ label, tip, checked, onChange }) {
   );
 }
 
+function SelectRow({ label, tip, value, onChange, options }) {
+  return (
+    <Tip tip={tip} as="label" className="ops-kv-ctrl">
+      <span className="ops-kv-ctrl-head">
+        <span className="ops-kv-label">{label}</span>
+      </span>
+      <select
+        className="ops-kv-select"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    </Tip>
+  );
+}
+
 export default function DataMapControls({
   resolution,
   onResolution,
@@ -81,6 +102,14 @@ export default function DataMapControls({
   visualPolygonFilter,
   onVisualPolygonFilter,
   metrics,
+  readNavigation,
+  onReadNavigation,
+  readMethod,
+  onReadMethod,
+  onClearCache,
+  autoRefresh = false,
+  onAutoRefresh,
+  busy,
 }) {
   const squareCells = areaMode === AREA_MODE_CELL;
   const modeLabel =
@@ -90,6 +119,57 @@ export default function DataMapControls({
 
   return (
     <div className="ops-kv data-map-kv">
+      {onReadNavigation && onReadMethod ? (
+        <Group
+          title="Lecture"
+          tip="Comment le client résout et récupère les sets sur le mesh (remonte le client)."
+        >
+          <SelectRow
+            label="navigation"
+            tip="ingress : passe par le nœud d’entrée session. direct : suit les redirects XOR vers le propriétaire."
+            value={readNavigation}
+            onChange={onReadNavigation}
+            options={[
+              { value: "direct", label: "direct" },
+              { value: "ingress", label: "ingress" },
+            ]}
+          />
+          <SelectRow
+            label="méthode"
+            tip="getSets : batch multi-zones. getSet : une zone par requête."
+            value={readMethod}
+            onChange={onReadMethod}
+            options={[
+              { value: "getSets", label: "getSets" },
+              { value: "getSet", label: "getSet" },
+            ]}
+          />
+          {typeof onAutoRefresh === "function" ? (
+            <CheckRow
+              label="refresh"
+              tip="Off : aucun tick. On : le worker relit périodiquement les zones visibles (delta) après settle caméra. N’affecte pas le pan/zoom."
+              checked={!!autoRefresh}
+              onChange={onAutoRefresh}
+            />
+          ) : null}
+          {onClearCache ? (
+            <Tip
+              tip="Vide le cache client /sets et les owner pins, puis re-fetch réseau (sans remount)."
+              className="ops-kv-ctrl"
+            >
+              <button
+                type="button"
+                className="ghost compact"
+                disabled={busy}
+                onClick={onClearCache}
+              >
+                Clear cache
+              </button>
+            </Tip>
+          ) : null}
+        </Group>
+      ) : null}
+
       <Group
         title="Visualisation"
         tip="Rendu carte : profondeur d’affichage, forme des zones, bascule heatmap ↔ points."

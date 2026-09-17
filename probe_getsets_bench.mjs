@@ -2,8 +2,7 @@
  * Live getSets latency probe against the local mesh.
  * Usage: INDEXUS_BEARER=... node probe_getsets_bench.mjs
  */
-import { Network, API } from "./src/himo/js-indexus-sdk/index.js";
-import { Peer } from "./src/himo/js-indexus-sdk/network/peer.js";
+import { Network, API, Peer } from "js-indexus-sdk";
 import { performance } from "node:perf_hooks";
 
 const COLL = "DvFMV2020idx0001";

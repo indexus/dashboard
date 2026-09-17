@@ -6,14 +6,16 @@ export default function Header({
   onTheme,
   tab,
   onTab,
+  networks,
+  activeNetworkId,
+  onNetwork,
+  onCreateNetwork,
+  onDeleteNetwork,
+  collections,
+  onCreateCollection,
+  onDeleteCollection,
   collection,
   onCollection,
-  mode,
-  onMode,
-  readNavigation,
-  onReadNavigation,
-  readMethod,
-  onReadMethod,
   peerHint,
   onReset,
   busy,
@@ -61,14 +63,16 @@ export default function Header({
         <CollectionBar
           tab={tab}
           onTab={onTab}
+          networks={networks}
+          activeNetworkId={activeNetworkId}
+          onNetwork={onNetwork}
+          onCreateNetwork={onCreateNetwork}
+          onDeleteNetwork={onDeleteNetwork}
+          collections={collections}
+          onCreateCollection={onCreateCollection}
+          onDeleteCollection={onDeleteCollection}
           collection={collection}
           onCollection={onCollection}
-          mode={mode}
-          onMode={onMode}
-          readNavigation={readNavigation}
-          onReadNavigation={onReadNavigation}
-          readMethod={readMethod}
-          onReadMethod={onReadMethod}
           peerHint={peerHint}
           onReset={onReset}
           busy={busy}
